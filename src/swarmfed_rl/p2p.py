@@ -171,9 +171,7 @@ class P2PAggregator:
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0
 
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                a, b = ids[i], ids[j]
+        for a, b in self._candidate_pairs(ids, positions):
                 if not self._can_exchange(step_idx, a, b, positions):
                     continue
                 payload_bytes = payload_bytes_cache[a]
@@ -227,6 +225,31 @@ class P2PAggregator:
             )
             agents[rid].load_actor_state(merged)
         return exchanges
+
+    def _candidate_pairs(
+        self,
+        ids: list[int],
+        positions: dict[int, np.ndarray],
+    ) -> list[tuple[int, int]]:
+        if not self.cfg.use_grid_index:
+            return [(ids[i], ids[j]) for i in range(len(ids)) for j in range(i + 1, len(ids))]
+        cell = max(1e-6, float(self.cfg.grid_cell_size))
+        buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for rid in ids:
+            px, py = float(positions[rid][0]), float(positions[rid][1])
+            key = (int(np.floor(px / cell)), int(np.floor(py / cell)))
+            buckets[key].append(rid)
+        neigh = (-1, 0, 1)
+        pair_set: set[tuple[int, int]] = set()
+        for (cx, cy), members in buckets.items():
+            local_cells = [(cx + dx, cy + dy) for dx in neigh for dy in neigh]
+            for rid in members:
+                for nc in local_cells:
+                    for other in buckets.get(nc, []):
+                        if rid >= other:
+                            continue
+                        pair_set.add((rid, other))
+        return sorted(pair_set)
 
     def _estimate_payload_bytes(self, state: dict[str, torch.Tensor]) -> int:
         threshold = max(0.0, float(self.cfg.weight_std_threshold))

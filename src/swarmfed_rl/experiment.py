@@ -63,6 +63,10 @@ def run_experiment(
     comm_radius: float | None = None,
     cooldown_steps: int | None = None,
     exchange_interval_steps: int | None = None,
+    frame_stack: int | None = None,
+    use_gpu_replay: bool | None = None,
+    use_grid_index: bool | None = None,
+    grid_cell_size: float | None = None,
 ) -> ExperimentSummary:
     if mode not in {"local", "centralized", "p2p"}:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -75,6 +79,10 @@ def run_experiment(
         cooldown_steps=cooldown_steps,
         exchange_interval_steps=exchange_interval_steps,
         weight_std_threshold=weight_std_threshold,
+        frame_stack=frame_stack,
+        use_gpu_replay=use_gpu_replay,
+        use_grid_index=use_grid_index,
+        grid_cell_size=grid_cell_size,
     )
     set_global_seed(cfg.seed)
     configure_torch_runtime(enable_tf32=cfg.sac.enable_tf32)
@@ -100,6 +108,10 @@ def run_experiment(
                 "comm_radius": comm_radius,
                 "cooldown_steps": cooldown_steps,
                 "exchange_interval_steps": exchange_interval_steps,
+                "frame_stack": frame_stack,
+                "use_gpu_replay": use_gpu_replay,
+                "use_grid_index": use_grid_index,
+                "grid_cell_size": grid_cell_size,
             },
         )
 

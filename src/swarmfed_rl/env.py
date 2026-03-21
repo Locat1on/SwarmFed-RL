@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,6 +35,8 @@ class SimulatedROS2Env:
         self.goal = np.zeros(2, dtype=np.float32)
         self.prev_distance = 0.0
         self.last_action = np.zeros(2, dtype=np.float32)
+        self.frame_stack = max(1, int(getattr(cfg, "frame_stack", 1)))
+        self._lidar_history: deque[np.ndarray] = deque(maxlen=self.frame_stack)
         self.episode_steps = 0
         self.collisions = 0
         self.success = 0
@@ -53,6 +56,10 @@ class SimulatedROS2Env:
         )
         self.prev_distance = self._distance_to_goal()
         self.last_action = np.zeros(2, dtype=np.float32)
+        self._lidar_history.clear()
+        first_lidar = self._mock_lidar_24()
+        for _ in range(self.frame_stack):
+            self._lidar_history.append(first_lidar.copy())
         self.episode_steps = 0
         return self._build_state()
 
@@ -74,6 +81,7 @@ class SimulatedROS2Env:
         proximity_penalty_coeff = float(getattr(self.cfg.reward, "proximity_penalty_coeff", 0.5))
         action_smoothness_coeff = float(getattr(self.cfg.reward, "action_smoothness_coeff", 0.1))
         lidar = self._mock_lidar_24()
+        self._lidar_history.append(lidar.copy())
         min_laser_dist = float(np.min(lidar))
         if min_laser_dist < danger_zone_distance:
             danger_ratio = max(0.0, 1.0 - (min_laser_dist / danger_zone_distance))
@@ -99,7 +107,8 @@ class SimulatedROS2Env:
 
         self.prev_distance = current_distance
         tail = self._build_tail()
-        next_state = np.concatenate([lidar, tail], axis=0).astype(np.float32)
+        stacked_lidar = self._stacked_lidar(lidar)
+        next_state = np.concatenate([stacked_lidar, tail], axis=0).astype(np.float32)
         return next_state, float(reward), done, info
 
     def get_position(self) -> np.ndarray:
@@ -119,8 +128,9 @@ class SimulatedROS2Env:
 
     def _build_state(self) -> np.ndarray:
         lidar = self._mock_lidar_24()
+        self._lidar_history.append(lidar.copy())
         tail = self._build_tail()
-        return np.concatenate([lidar, tail], axis=0).astype(np.float32)
+        return np.concatenate([self._stacked_lidar(lidar), tail], axis=0).astype(np.float32)
 
     def _build_tail(self) -> np.ndarray:
         goal_dx = float(self.goal[0] - self.state.x)
@@ -175,10 +185,13 @@ class SimulatedROS2Env:
         noise = self.rng.normal(0.0, 0.02, size=beam_count).astype(np.float32)
         return np.clip(distances + noise, 0.02, max_range).astype(np.float32)
 
+    def _stacked_lidar(self, latest_lidar: np.ndarray) -> np.ndarray:
+        if not self._lidar_history:
+            return latest_lidar
+        while len(self._lidar_history) < self.frame_stack:
+            self._lidar_history.appendleft(self._lidar_history[0].copy())
+        return np.concatenate(list(self._lidar_history), axis=0).astype(np.float32)
+
     @staticmethod
     def _normalize_angle(theta: float) -> float:
-        while theta > math.pi:
-            theta -= 2 * math.pi
-        while theta < -math.pi:
-            theta += 2 * math.pi
-        return theta
+        return float((theta + math.pi) % (2.0 * math.pi) - math.pi)

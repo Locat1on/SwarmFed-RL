@@ -67,8 +67,9 @@ class ChunkHeader:
 
 
 class ChunkReassembler:
-    def __init__(self, ttl_sec: float = 2.0) -> None:
+    def __init__(self, ttl_sec: float = 5.0, max_pending_messages: int = 2048) -> None:
         self.ttl_sec = ttl_sec
+        self.max_pending_messages = max_pending_messages
         self._pending: dict[
             tuple[int, int, int, int, int],
             dict[str, object],
@@ -88,6 +89,8 @@ class ChunkReassembler:
 
         bucket = self._pending.get(key)
         if bucket is None:
+            if len(self._pending) >= self.max_pending_messages:
+                self._evict_oldest()
             bucket = {
                 "created_at": now,
                 "chunks": {},
@@ -97,9 +100,14 @@ class ChunkReassembler:
             }
             self._pending[key] = bucket
 
+        if header.chunk_index >= int(bucket["total"]):
+            self._pending.pop(key, None)
+            raise ValueError("Chunk index out of range for payload reassembly")
+
         chunks: dict[int, bytes] = bucket["chunks"]  # type: ignore[assignment]
+        if header.chunk_index not in chunks:
+            bucket["raw_bytes"] = int(bucket["raw_bytes"]) + len(raw)
         chunks[header.chunk_index] = chunk_payload
-        bucket["raw_bytes"] = int(bucket["raw_bytes"]) + len(raw)
 
         if len(chunks) < int(bucket["total"]):
             return None
@@ -122,6 +130,15 @@ class ChunkReassembler:
                 stale.append(k)
         for k in stale:
             self._pending.pop(k, None)
+
+    def _evict_oldest(self) -> None:
+        if not self._pending:
+            return
+        oldest_key = min(
+            self._pending.keys(),
+            key=lambda k: float(self._pending[k]["created_at"]),
+        )
+        self._pending.pop(oldest_key, None)
 
 
 class ROS2StateAdapter:
@@ -177,11 +194,7 @@ class ROS2StateAdapter:
 
 
 def normalize_angle(theta: float) -> float:
-    while theta > math.pi:
-        theta -= 2 * math.pi
-    while theta < -math.pi:
-        theta += 2 * math.pi
-    return theta
+    return float((theta + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 class NeighborCooldownGate:
@@ -365,7 +378,8 @@ class ROS2RLNode(Node):  # pragma: no cover
         self.weights_bytes_received = 0
         self.max_chunk_payload = max_chunk_payload
         self.retransmit_count = max(1, retransmit_count)
-        self._reassembler = ChunkReassembler(ttl_sec=2.0)
+        self._reassembler = ChunkReassembler(ttl_sec=5.0, max_pending_messages=4096)
+        self._incoming_weights_maxlen = 1024
 
         self.scan_sub = self.create_subscription(LaserScan, scan_topic, self._on_scan, qos_profile_sensor_data)
         self.odom_sub = self.create_subscription(Odometry, odom_topic, self._on_odom, qos_profile_sensor_data)
@@ -405,6 +419,8 @@ class ROS2RLNode(Node):  # pragma: no cover
                     payload_size_bytes=raw_size,
                 )
             )
+            while len(self._incoming_weights) > self._incoming_weights_maxlen:
+                self._incoming_weights.popleft()
             return
         except ValueError:
             if raw.startswith(_CHUNK_MAGIC):
@@ -424,6 +440,8 @@ class ROS2RLNode(Node):  # pragma: no cover
                 payload_size_bytes=len(raw),
             )
         )
+        while len(self._incoming_weights) > self._incoming_weights_maxlen:
+            self._incoming_weights.popleft()
 
     def publish_action(self, linear_v: float, angular_w: float) -> None:
         cmd = Twist()

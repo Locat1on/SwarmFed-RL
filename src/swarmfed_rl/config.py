@@ -49,6 +49,7 @@ class SACConfig:
     enable_tf32: bool = True
     enable_torch_compile: bool = False
     compile_mode: str = "reduce-overhead"
+    use_gpu_replay: bool = True
 
 
 @dataclass(frozen=True)
@@ -58,11 +59,14 @@ class P2PConfig:
     beta: float = 0.7
     exchange_interval_steps: int = 20
     weight_std_threshold: float = 0.01
+    use_grid_index: bool = True
+    grid_cell_size: float = 2.0
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     state_dim: int = 28
+    frame_stack: int = 1
     action_dim: int = 2
     action_low: tuple[float, float] = (0.0, -1.5)
     action_high: tuple[float, float] = (0.22, 1.5)
@@ -83,11 +87,47 @@ def build_config(
     cooldown_steps: int | None = None,
     exchange_interval_steps: int | None = None,
     weight_std_threshold: float | None = None,
+    frame_stack: int | None = None,
+    use_gpu_replay: bool | None = None,
+    use_grid_index: bool | None = None,
+    grid_cell_size: float | None = None,
 ) -> ExperimentConfig:
     base = ExperimentConfig()
+    frame_stack_val = max(1, int(frame_stack if frame_stack is not None else base.frame_stack))
+    state_dim_val = 24 * frame_stack_val + 4
     seed_cfg = SeedConfig(
         seed=seed if seed is not None else base.seed.seed,
         deterministic_torch=base.seed.deterministic_torch,
+    )
+    sac_cfg = SACConfig(
+        gamma=base.sac.gamma,
+        tau=base.sac.tau,
+        actor_lr=base.sac.actor_lr,
+        critic_lr=base.sac.critic_lr,
+        alpha_lr=base.sac.alpha_lr,
+        batch_size=base.sac.batch_size,
+        buffer_size=base.sac.buffer_size,
+        hidden_size=base.sac.hidden_size,
+        hidden_layers=base.sac.hidden_layers,
+        residual=base.sac.residual,
+        actor_encoder=base.sac.actor_encoder,
+        actor_use_cnn=base.sac.actor_use_cnn,
+        attention_dim=base.sac.attention_dim,
+        attention_heads=base.sac.attention_heads,
+        attention_layers=base.sac.attention_layers,
+        warmup_steps=base.sac.warmup_steps,
+        update_after=base.sac.update_after,
+        update_every=base.sac.update_every,
+        gradient_updates=base.sac.gradient_updates,
+        log_std_min=base.sac.log_std_min,
+        log_std_max=base.sac.log_std_max,
+        grad_clip_norm=base.sac.grad_clip_norm,
+        use_amp=base.sac.use_amp,
+        amp_dtype=base.sac.amp_dtype,
+        enable_tf32=base.sac.enable_tf32,
+        enable_torch_compile=base.sac.enable_torch_compile,
+        compile_mode=base.sac.compile_mode,
+        use_gpu_replay=base.sac.use_gpu_replay if use_gpu_replay is None else bool(use_gpu_replay),
     )
     p2p_cfg = P2PConfig(
         comm_radius=comm_radius if comm_radius is not None else base.p2p.comm_radius,
@@ -103,9 +143,14 @@ def build_config(
             if weight_std_threshold is not None
             else base.p2p.weight_std_threshold
         ),
+        use_grid_index=base.p2p.use_grid_index if use_grid_index is None else bool(use_grid_index),
+        grid_cell_size=(
+            float(base.p2p.grid_cell_size if grid_cell_size is None else grid_cell_size)
+        ),
     )
     return ExperimentConfig(
-        state_dim=base.state_dim,
+        state_dim=state_dim_val,
+        frame_stack=frame_stack_val,
         action_dim=base.action_dim,
         action_low=base.action_low,
         action_high=base.action_high,
@@ -114,6 +159,6 @@ def build_config(
         goal_threshold=base.goal_threshold,
         seed=seed_cfg,
         reward=base.reward,
-        sac=base.sac,
+        sac=sac_cfg,
         p2p=p2p_cfg,
     )

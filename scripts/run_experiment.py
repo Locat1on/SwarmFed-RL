@@ -58,6 +58,10 @@ def main() -> None:
     parser.add_argument("--comm-radius", type=float, default=None, help="P2P communication radius override")
     parser.add_argument("--cooldown-steps", type=int, default=None, help="P2P cooldown steps override")
     parser.add_argument("--exchange-interval-steps", type=int, default=None, help="P2P exchange interval override")
+    parser.add_argument("--frame-stack", type=int, default=1, help="Number of lidar frames to stack into state")
+    parser.add_argument("--gpu-replay-buffer", action="store_true", help="Use GPU resident replay buffer when CUDA is available")
+    parser.add_argument("--disable-grid-index", action="store_true", help="Disable P2P grid-based neighbor candidate indexing")
+    parser.add_argument("--grid-cell-size", type=float, default=2.0, help="Grid cell size for P2P neighbor indexing")
     parser.add_argument("--run-name", type=str, default=None, help="Name of the run (default: auto-generated)")
     parser.add_argument("--artifact-root", type=str, default="artifacts", help="Root directory for artifacts")
     args = parser.parse_args()
@@ -179,6 +183,10 @@ def main() -> None:
                 comm_radius=args.comm_radius,
                 cooldown_steps=args.cooldown_steps,
                 exchange_interval_steps=args.exchange_interval_steps,
+                frame_stack=args.frame_stack,
+                use_gpu_replay=args.gpu_replay_buffer,
+                use_grid_index=(not args.disable_grid_index),
+                grid_cell_size=args.grid_cell_size,
             )
             print(
                 "Experiment finished | "

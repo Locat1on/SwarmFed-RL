@@ -132,7 +132,7 @@ class Actor(nn.Module):
             raise ValueError(f"Unsupported actor encoder: {self.encoder_type}")
         if use_cnn_encoder and self.encoder_type == "mlp":
             self.encoder_type = "cnn"
-        self.radar_dim = 24
+        self.radar_dim = max(24, state_dim - 4)
         self.tail_dim = max(0, state_dim - self.radar_dim)
         if self.encoder_type in {"attention", "cnn"} and state_dim < self.radar_dim:
             raise ValueError("state_dim must be >= 24 when actor encoder uses radar split")
@@ -234,6 +234,46 @@ class ReplayBuffer:
         )
 
 
+class GPUReplayBuffer:
+    def __init__(self, state_dim: int, action_dim: int, capacity: int, device: torch.device) -> None:
+        self.capacity = capacity
+        self.ptr = 0
+        self.size = 0
+        self.device = device
+        self.states = torch.empty((capacity, state_dim), dtype=torch.float32, device=device)
+        self.actions = torch.empty((capacity, action_dim), dtype=torch.float32, device=device)
+        self.rewards = torch.empty((capacity, 1), dtype=torch.float32, device=device)
+        self.next_states = torch.empty((capacity, state_dim), dtype=torch.float32, device=device)
+        self.dones = torch.empty((capacity, 1), dtype=torch.float32, device=device)
+
+    def push(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        i = self.ptr
+        self.states[i].copy_(torch.as_tensor(state, dtype=torch.float32, device=self.device))
+        self.actions[i].copy_(torch.as_tensor(action, dtype=torch.float32, device=self.device))
+        self.rewards[i, 0] = float(reward)
+        self.next_states[i].copy_(torch.as_tensor(next_state, dtype=torch.float32, device=self.device))
+        self.dones[i, 0] = float(done)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+        idx = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return (
+            self.states.index_select(0, idx),
+            self.actions.index_select(0, idx),
+            self.rewards.index_select(0, idx),
+            self.next_states.index_select(0, idx),
+            self.dones.index_select(0, idx),
+        )
+
+
 @dataclass
 class SACAgent:
     cfg: ExperimentConfig
@@ -309,7 +349,18 @@ class SACAgent:
             1, self.cfg.sac.gradient_updates if self.device.type == "cuda" else 1
         )
 
-        self.buffer = ReplayBuffer(self.cfg.state_dim, self.cfg.action_dim, self.cfg.sac.buffer_size)
+        use_gpu_replay = bool(
+            self.cfg.sac.use_gpu_replay and self.device.type == "cuda"
+        )
+        if use_gpu_replay:
+            self.buffer = GPUReplayBuffer(
+                self.cfg.state_dim,
+                self.cfg.action_dim,
+                self.cfg.sac.buffer_size,
+                self.device,
+            )
+        else:
+            self.buffer = ReplayBuffer(self.cfg.state_dim, self.cfg.action_dim, self.cfg.sac.buffer_size)
 
     @staticmethod
     def _safe_loss(loss: torch.Tensor, name: str) -> None:
@@ -437,4 +488,8 @@ class SACAgent:
         return {k: v.detach().clone() for k, v in self.actor.state_dict().items()}
 
     def load_actor_state(self, state_dict: dict[str, torch.Tensor]) -> None:
-        self.actor.load_state_dict(state_dict)
+        isolated = {
+            k: v.detach().to(self.device).clone()
+            for k, v in state_dict.items()
+        }
+        self.actor.load_state_dict(isolated)
