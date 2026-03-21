@@ -239,11 +239,14 @@ def _compute_reward_done(
     current_distance = _distance_to_goal(node.get_position_xy(), goal_xy)
     progress = prev_distance - current_distance
     reward = cfg.reward.progress_coeff * progress + cfg.reward.step_penalty
+    danger_zone_distance = float(getattr(cfg.reward, "danger_zone_distance", 0.5))
+    proximity_penalty_coeff = float(getattr(cfg.reward, "proximity_penalty_coeff", 0.5))
+    action_smoothness_coeff = float(getattr(cfg.reward, "action_smoothness_coeff", 0.1))
     min_scan = node.get_min_scan()
-    if min_scan < cfg.reward.danger_zone_distance:
-        danger_ratio = max(0.0, 1.0 - (min_scan / cfg.reward.danger_zone_distance))
-        reward -= cfg.reward.proximity_penalty_coeff * danger_ratio
-    reward -= cfg.reward.action_smoothness_coeff * float(np.linalg.norm(current_action - last_action))
+    if min_scan < danger_zone_distance:
+        danger_ratio = max(0.0, 1.0 - (min_scan / danger_zone_distance))
+        reward -= proximity_penalty_coeff * danger_ratio
+    reward -= action_smoothness_coeff * float(np.linalg.norm(current_action - last_action))
     is_collision = min_scan <= collision_scan_threshold
     is_success = current_distance <= cfg.goal_threshold
     done = False

@@ -70,13 +70,16 @@ class SimulatedROS2Env:
         current_distance = self._distance_to_goal()
         progress = self.prev_distance - current_distance
         reward = self.cfg.reward.progress_coeff * progress + self.cfg.reward.step_penalty
+        danger_zone_distance = float(getattr(self.cfg.reward, "danger_zone_distance", 0.5))
+        proximity_penalty_coeff = float(getattr(self.cfg.reward, "proximity_penalty_coeff", 0.5))
+        action_smoothness_coeff = float(getattr(self.cfg.reward, "action_smoothness_coeff", 0.1))
         lidar = self._mock_lidar_24()
         min_laser_dist = float(np.min(lidar))
-        if min_laser_dist < self.cfg.reward.danger_zone_distance:
-            danger_ratio = max(0.0, 1.0 - (min_laser_dist / self.cfg.reward.danger_zone_distance))
-            reward -= self.cfg.reward.proximity_penalty_coeff * danger_ratio
+        if min_laser_dist < danger_zone_distance:
+            danger_ratio = max(0.0, 1.0 - (min_laser_dist / danger_zone_distance))
+            reward -= proximity_penalty_coeff * danger_ratio
         action_diff = float(np.linalg.norm(np.asarray([v, omega], dtype=np.float32) - self.last_action))
-        reward -= self.cfg.reward.action_smoothness_coeff * action_diff
+        reward -= action_smoothness_coeff * action_diff
         self.last_action = np.asarray([v, omega], dtype=np.float32)
         done = False
         info: dict[str, float | bool] = {"collision": False, "success": False}
