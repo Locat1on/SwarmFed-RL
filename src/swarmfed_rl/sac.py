@@ -11,32 +11,165 @@ from torch.distributions import Normal
 from .config import ExperimentConfig
 
 
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden: int) -> None:
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, out_dim),
-        )
+        self.fc1 = nn.Linear(hidden, hidden)
+        self.ln1 = nn.LayerNorm(hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.act = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        h = self.fc1(x)
+        h = self.ln1(h)
+        h = self.act(h)
+        h = self.fc2(h)
+        h = self.ln2(h)
+        return self.act(x + h)
+
+
+class DeepMLP(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden: int, hidden_layers: int, residual: bool) -> None:
+        super().__init__()
+        if hidden_layers < 2:
+            raise ValueError("hidden_layers must be >= 2")
+        self.in_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+        self.blocks = nn.ModuleList()
+        block_count = hidden_layers - 1
+        if residual:
+            for _ in range(block_count):
+                self.blocks.append(ResidualBlock(hidden))
+        else:
+            for _ in range(block_count):
+                self.blocks.append(
+                    nn.Sequential(
+                        nn.Linear(hidden, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                    )
+                )
+        self.out_proj = nn.Linear(hidden, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.in_proj(x)
+        for block in self.blocks:
+            h = block(h)
+        return self.out_proj(h)
+
+
+class Radar1DEncoder(nn.Module):
+    def __init__(self, out_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(64, out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, radar: torch.Tensor) -> torch.Tensor:
+        # radar: [B, 24]
+        return self.net(radar.unsqueeze(1))
+
+
+class RadarAttentionEncoder(nn.Module):
+    def __init__(self, out_dim: int, model_dim: int, heads: int, layers: int) -> None:
+        super().__init__()
+        self.in_proj = nn.Linear(1, model_dim)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dim_feedforward=model_dim * 2,
+            dropout=0.0,
+            activation="relu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.out_proj = nn.Sequential(
+            nn.Linear(model_dim, out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, radar: torch.Tensor) -> torch.Tensor:
+        # radar: [B, 24] -> tokens [B, 24, 1]
+        tokens = radar.unsqueeze(-1)
+        h = self.in_proj(tokens)
+        h = self.encoder(h)
+        pooled = h.mean(dim=1)
+        return self.out_proj(pooled)
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int, log_std_min: float, log_std_max: float) -> None:
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden: int,
+        hidden_layers: int,
+        residual: bool,
+        encoder_type: str,
+        use_cnn_encoder: bool,
+        attention_dim: int,
+        attention_heads: int,
+        attention_layers: int,
+        log_std_min: float,
+        log_std_max: float,
+    ) -> None:
         super().__init__()
-        self.backbone = MLP(state_dim, hidden, hidden)
+        self.encoder_type = encoder_type
+        if self.encoder_type not in {"attention", "cnn", "mlp"}:
+            raise ValueError(f"Unsupported actor encoder: {self.encoder_type}")
+        if use_cnn_encoder and self.encoder_type == "mlp":
+            self.encoder_type = "cnn"
+        self.radar_dim = 24
+        self.tail_dim = max(0, state_dim - self.radar_dim)
+        if self.encoder_type in {"attention", "cnn"} and state_dim < self.radar_dim:
+            raise ValueError("state_dim must be >= 24 when actor encoder uses radar split")
+        if self.encoder_type == "attention":
+            self.radar_encoder = RadarAttentionEncoder(
+                out_dim=hidden // 2,
+                model_dim=attention_dim,
+                heads=attention_heads,
+                layers=attention_layers,
+            )
+            self.tail_encoder = nn.Sequential(
+                nn.Linear(self.tail_dim, hidden // 2),
+                nn.ReLU(),
+            )
+            self.backbone = DeepMLP(hidden, hidden, hidden, hidden_layers, residual)
+        elif self.encoder_type == "cnn":
+            self.radar_encoder = Radar1DEncoder(out_dim=hidden // 2)
+            self.tail_encoder = nn.Sequential(
+                nn.Linear(self.tail_dim, hidden // 2),
+                nn.ReLU(),
+            )
+            self.backbone = DeepMLP(hidden, hidden, hidden, hidden_layers, residual)
+        else:
+            self.backbone = DeepMLP(state_dim, hidden, hidden, hidden_layers, residual)
         self.mu = nn.Linear(hidden, action_dim)
         self.log_std = nn.Linear(hidden, action_dim)
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
     def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.backbone(state)
+        if self.encoder_type in {"attention", "cnn"}:
+            radar = state[..., : self.radar_dim]
+            tail = state[..., self.radar_dim :]
+            radar_feat = self.radar_encoder(radar)
+            tail_feat = self.tail_encoder(tail)
+            h = self.backbone(torch.cat([radar_feat, tail_feat], dim=-1))
+        else:
+            h = self.backbone(state)
         mu = self.mu(h)
         log_std = torch.clamp(self.log_std(h), self.log_std_min, self.log_std_max)
         return mu, log_std
@@ -53,9 +186,9 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int) -> None:
+    def __init__(self, state_dim: int, action_dim: int, hidden: int, hidden_layers: int, residual: bool) -> None:
         super().__init__()
-        self.q = MLP(state_dim + action_dim, 1, hidden)
+        self.q = DeepMLP(state_dim + action_dim, 1, hidden, hidden_layers, residual)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         return self.q(torch.cat([state, action], dim=-1))
@@ -111,13 +244,44 @@ class SACAgent:
             self.cfg.state_dim,
             self.cfg.action_dim,
             hidden,
+            self.cfg.sac.hidden_layers,
+            self.cfg.sac.residual,
+            self.cfg.sac.actor_encoder,
+            self.cfg.sac.actor_use_cnn,
+            self.cfg.sac.attention_dim,
+            self.cfg.sac.attention_heads,
+            self.cfg.sac.attention_layers,
             self.cfg.sac.log_std_min,
             self.cfg.sac.log_std_max,
         ).to(self.device)
-        self.q1 = Critic(self.cfg.state_dim, self.cfg.action_dim, hidden).to(self.device)
-        self.q2 = Critic(self.cfg.state_dim, self.cfg.action_dim, hidden).to(self.device)
-        self.q1_target = Critic(self.cfg.state_dim, self.cfg.action_dim, hidden).to(self.device)
-        self.q2_target = Critic(self.cfg.state_dim, self.cfg.action_dim, hidden).to(self.device)
+        self.q1 = Critic(
+            self.cfg.state_dim,
+            self.cfg.action_dim,
+            hidden,
+            self.cfg.sac.hidden_layers,
+            self.cfg.sac.residual,
+        ).to(self.device)
+        self.q2 = Critic(
+            self.cfg.state_dim,
+            self.cfg.action_dim,
+            hidden,
+            self.cfg.sac.hidden_layers,
+            self.cfg.sac.residual,
+        ).to(self.device)
+        self.q1_target = Critic(
+            self.cfg.state_dim,
+            self.cfg.action_dim,
+            hidden,
+            self.cfg.sac.hidden_layers,
+            self.cfg.sac.residual,
+        ).to(self.device)
+        self.q2_target = Critic(
+            self.cfg.state_dim,
+            self.cfg.action_dim,
+            hidden,
+            self.cfg.sac.hidden_layers,
+            self.cfg.sac.residual,
+        ).to(self.device)
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 

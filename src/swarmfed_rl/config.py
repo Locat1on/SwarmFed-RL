@@ -27,6 +27,13 @@ class SACConfig:
     batch_size: int = 256
     buffer_size: int = 200_000
     hidden_size: int = 256
+    hidden_layers: int = 4
+    residual: bool = True
+    actor_encoder: str = "attention"  # attention | cnn | mlp
+    actor_use_cnn: bool = True  # deprecated compatibility flag
+    attention_dim: int = 64
+    attention_heads: int = 4
+    attention_layers: int = 1
     warmup_steps: int = 2_000
     update_after: int = 2_000
     update_every: int = 1

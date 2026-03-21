@@ -122,6 +122,35 @@ artifacts/
 - 问题：Replay Buffer 中动作已归一化到 `[-1,1]`，训练时又二次归一化，导致 Critic 输入畸变。
 - 修复：`sac.py` 中 Critic 训练直接使用采样动作，不再重复归一化。
 
+### 1.1) SAC 骨干网络增强（已实现）
+
+- 将原始浅层 MLP 升级为更深的网络骨干：
+  - 默认 `hidden_layers=4`
+  - 默认 `hidden_size=256`
+  - 默认启用残差块与 LayerNorm（`residual=True`）
+- 覆盖范围：
+  - Actor backbone
+  - Critic / Target Critic backbone
+- 兼容性：
+  - 训练流程、数据结构、脚本参数保持兼容；
+  - 仅提升表达能力，不改变动作/奖励接口。
+
+### 1.2) Actor 雷达编码器升级（已实现）
+
+- Actor 输入支持 `1D-CNN` 雷达编码（默认开启）：
+  - 前 24 维雷达使用卷积编码；
+  - 其余尾部状态（速度、角速度、目标距离、朝向误差）走独立线性编码；
+  - 二者融合后进入深层残差骨干。
+- 配置项（`SACConfig`）：
+  - `actor_encoder: str = "attention"`（`attention | cnn | mlp`）
+  - `attention_dim: int = 64`
+  - `attention_heads: int = 4`
+  - `attention_layers: int = 1`
+  - `actor_use_cnn` 保留为兼容字段（deprecated）
+- Critic 仍保持 MLP 输入，保证训练稳定与兼容。
+
+补充：已实现 Actor 自注意力编码器（Transformer Encoder），现在默认使用 `attention`。
+
 ### 2) ROS2 传感器 QoS 不匹配（已修复）
 
 - 问题：`/scan`、`/odom` 订阅使用默认可靠 QoS，可能收不到 SensorData(BestEffort)。
