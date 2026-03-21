@@ -167,6 +167,7 @@ class P2PAggregator:
         malicious_nodes = malicious_nodes or set()
         ids = sorted(agents.keys())
         current_states = {rid: agents[rid].get_actor_state() for rid in ids}
+        payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0
 
@@ -175,7 +176,7 @@ class P2PAggregator:
                 a, b = ids[i], ids[j]
                 if not self._can_exchange(step_idx, a, b, positions):
                     continue
-                payload_bytes = self._estimate_payload_bytes(current_states[a])
+                payload_bytes = payload_bytes_cache[a]
                 self.bytes_transferred += payload_bytes * 2
 
                 incoming_to_a = self._apply_attack(

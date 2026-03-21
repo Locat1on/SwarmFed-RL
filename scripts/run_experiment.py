@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("--calibration-steps", type=int, default=500)
     parser.add_argument("--attack-start-step", type=int, default=500)
     parser.add_argument("--tensorboard-log-dir", type=str, default=None)
+    parser.add_argument("--enable-tensorboard", action="store_true", help="Enable TensorBoard logging (disabled by default for speed)")
     parser.add_argument("--config-snapshot", type=str, default=None)
     parser.add_argument("--progress-every", type=int, default=500)
     parser.add_argument("--run-name", type=str, default=None, help="Name of the run (default: auto-generated)")
@@ -90,10 +91,12 @@ def main() -> None:
         checkpoint_dir = str(root / "checkpoints" / args.mode / run_name)
         
     # TensorBoard
-    if args.tensorboard_log_dir:
+    if args.enable_tensorboard and args.tensorboard_log_dir:
         tb_dir = args.tensorboard_log_dir
-    else:
+    elif args.enable_tensorboard:
         tb_dir = str(root / "tb" / args.mode / run_name)
+    else:
+        tb_dir = None
         
     # Config Snapshot
     if args.config_snapshot:
@@ -109,7 +112,8 @@ def main() -> None:
     # Ensure parent directories exist where appropriate
     log_csv_path.parent.mkdir(parents=True, exist_ok=True)
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    Path(tb_dir).mkdir(parents=True, exist_ok=True)
+    if tb_dir is not None:
+        Path(tb_dir).mkdir(parents=True, exist_ok=True)
     Path(config_path).parent.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
     terminal_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,7 +129,7 @@ def main() -> None:
             print(f"Logs(Term):  {terminal_log_path}")
             print(f"Plots:       {plot_dir}")
             print(f"Checkpoints: {checkpoint_dir}")
-            print(f"TensorBoard: {tb_dir}")
+            print(f"TensorBoard: {tb_dir if tb_dir is not None else 'disabled'}")
             print(f"Config:      {config_path}")
 
             # If using Krum defense and user didn't specify krum count, try to infer or validate
