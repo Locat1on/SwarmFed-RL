@@ -228,6 +228,28 @@ python scripts/run_full_pipeline.py --robots 30 --warmup-timesteps 5000 --timest
 
 默认输出在：`artifacts\pipeline\`
 
+## 性能模式（5090推荐）
+
+若你追求吞吐而非“严格 P2P 实验”：
+
+```bash
+python scripts/run_experiment.py --mode p2p --robots 30 --timesteps 20000 --shared-agent --progress-every 500
+```
+
+说明：
+
+- `--shared-agent`：所有机器人共享同一套 Actor/Critic 与回放池；
+- 每步仅执行一次集中更新，显著减少多Agent串行训练的CPU开销；
+- 这是当前代码里最有效的提速模式之一。
+
+注意：严格 P2P 评估应使用“独立 Agent + 交换”。当前脚本在 `--mode p2p` 下会自动禁用 `--shared-agent`，避免实验设定被破坏。
+
+推荐严格 P2P命令：
+
+```bash
+python scripts/run_experiment.py --mode p2p --robots 30 --timesteps 20000 --progress-every 500
+```
+
 ## 常见问题
 
 - **Reward 一直是负的？**  

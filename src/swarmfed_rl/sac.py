@@ -331,10 +331,26 @@ class SACAgent:
         action = act.squeeze(0).cpu().numpy()
         return self._rescale_action(action)
 
+    def select_actions(self, states: np.ndarray, deterministic: bool = False) -> np.ndarray:
+        s = torch.as_tensor(states, device=self.device, dtype=torch.float32)
+        with torch.no_grad():
+            if deterministic:
+                mu, _ = self.actor(s)
+                act = torch.tanh(mu)
+            else:
+                act, _ = self.actor.sample(s)
+        actions = act.cpu().numpy()
+        return self._rescale_actions(actions)
+
     def _rescale_action(self, tanh_action: np.ndarray) -> np.ndarray:
         low = np.asarray(self.cfg.action_low, dtype=np.float32)
         high = np.asarray(self.cfg.action_high, dtype=np.float32)
         return low + (tanh_action + 1.0) * (high - low) / 2.0
+
+    def _rescale_actions(self, tanh_actions: np.ndarray) -> np.ndarray:
+        low = np.asarray(self.cfg.action_low, dtype=np.float32)
+        high = np.asarray(self.cfg.action_high, dtype=np.float32)
+        return low + (tanh_actions + 1.0) * (high - low) / 2.0
 
     def train_step(self) -> dict[str, float]:
         self._train_call_count += 1

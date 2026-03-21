@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -56,6 +57,8 @@ def run_experiment(
     tensorboard_log_dir: str | None = None,
     config_snapshot_path: str | None = None,
     progress_every: int | None = None,
+    shared_agent: bool = False,
+    env_step_workers: int = 0,
 ) -> ExperimentSummary:
     if mode not in {"local", "centralized", "p2p"}:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -80,15 +83,31 @@ def run_experiment(
                 "attack_type": attack_type,
                 "calibration_steps": calibration_steps,
                 "attack_start_step": attack_start_step,
+                "shared_agent": shared_agent,
+                "env_step_workers": env_step_workers,
             },
         )
 
     envs = {rid: SimulatedROS2Env(cfg, rid) for rid in range(num_robots)}
-    agents = {rid: SACAgent(cfg, device) for rid in range(num_robots)}
+    if shared_agent:
+        shared = SACAgent(cfg, device)
+        # fast training path
+        agents = {rid: shared for rid in range(num_robots)}
+        # communication view for P2P/Centralized exchange
+        shadow_agents = {rid: SACAgent(cfg, device) for rid in range(num_robots)}
+    else:
+        agents = {rid: SACAgent(cfg, device) for rid in range(num_robots)}
+        shadow_agents = agents
     states = {rid: envs[rid].reset() for rid in range(num_robots)}
 
     if load_checkpoint_dir:
-        _load_actor_checkpoints(agents, load_checkpoint_dir)
+        if shared_agent:
+            _load_shared_actor_checkpoint(next(iter(agents.values())), load_checkpoint_dir)
+            shared_state = next(iter(agents.values())).get_actor_state()
+            for sa in shadow_agents.values():
+                sa.load_actor_state(shared_state)
+        else:
+            _load_actor_checkpoints(agents, load_checkpoint_dir)
 
     p2p = P2PAggregator(cfg.p2p)
     centralized = CentralizedFedAvg(interval_steps=cfg.p2p.exchange_interval_steps, beta=cfg.p2p.beta)
@@ -106,21 +125,43 @@ def run_experiment(
         if SummaryWriter is None:
             raise RuntimeError("TensorBoard support is unavailable; install tensorboard package.")
         tb_writer = SummaryWriter(log_dir=tensorboard_log_dir)
+    step_executor = None
+    if shared_agent and env_step_workers > 1:
+        step_executor = ThreadPoolExecutor(max_workers=env_step_workers)
 
     try:
         for step in range(cfg.max_timesteps):
             positions: dict[int, np.ndarray] = {}
             step_reward = 0.0
+            batch_actions_by_rid: dict[int, np.ndarray] = {}
+            if shared_agent:
+                shared = next(iter(agents.values()))
+                rid_list = list(range(num_robots))
+                state_batch = np.stack([states[rid] for rid in rid_list], axis=0).astype(np.float32)
+                action_batch = shared.select_actions(state_batch, deterministic=False)
+                batch_actions_by_rid = {rid: action_batch[i] for i, rid in enumerate(rid_list)}
+
+            if shared_agent and step_executor is not None:
+                step_futures = {
+                    rid: step_executor.submit(envs[rid].step, batch_actions_by_rid[rid]) for rid in range(num_robots)
+                }
+                step_outputs = {rid: fut.result() for rid, fut in step_futures.items()}
+            else:
+                step_outputs = {}
 
             for rid in range(num_robots):
                 agent = agents[rid]
                 env = envs[rid]
                 state = states[rid]
-                action = agent.select_action(state, deterministic=False)
-                next_state, reward, done, info = env.step(action)
+                action = batch_actions_by_rid[rid] if shared_agent else agent.select_action(state, deterministic=False)
+                if step_outputs:
+                    next_state, reward, done, info = step_outputs[rid]
+                else:
+                    next_state, reward, done, info = env.step(action)
                 normalized_action = _normalize_action(action, cfg.action_low, cfg.action_high)
                 agent.buffer.push(state, normalized_action.astype(np.float32), reward, next_state, done)
-                agent.train_step()
+                if not shared_agent:
+                    agent.train_step()
                 states[rid] = env.reset() if done else next_state
                 positions[rid] = env.get_position()
 
@@ -135,7 +176,37 @@ def run_experiment(
                 if bool(info["collision"]):
                     collisions += 1
 
-            if mode == "p2p":
+            if shared_agent:
+                shared_ref = next(iter(agents.values()))
+                shared_ref.train_step()
+                shared_state = shared_ref.get_actor_state()
+                for sa in shadow_agents.values():
+                    sa.load_actor_state(shared_state)
+                if mode == "p2p":
+                    exchanges += p2p.maybe_exchange(
+                        step_idx=step,
+                        agents=shadow_agents,
+                        positions=positions,
+                        malicious_nodes=malicious_nodes,
+                        attack_type=attack_type,
+                        defense_enabled=defense_enabled,
+                        defense_strategy=defense_strategy,
+                        defense_trim_ratio=defense_trim_ratio,
+                        defense_krum_malicious=defense_krum_malicious,
+                        calibration_steps=calibration_steps,
+                        attack_start_step=attack_start_step,
+                    )
+                    comm_bytes = p2p.bytes_transferred
+                    shadow_mean = _average_actor_state(shadow_agents)
+                    shared_ref.load_actor_state(shadow_mean)
+                elif mode == "centralized":
+                    exchanges += centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
+                    comm_bytes = centralized.bytes_transferred
+                    shadow_mean = _average_actor_state(shadow_agents)
+                    shared_ref.load_actor_state(shadow_mean)
+                else:
+                    comm_bytes = 0
+            elif mode == "p2p":
                 exchanges += p2p.maybe_exchange(
                     step_idx=step,
                     agents=agents,
@@ -208,9 +279,14 @@ def run_experiment(
             csv_file.close()
         if tb_writer is not None:
             tb_writer.close()
+        if step_executor is not None:
+            step_executor.shutdown(wait=True)
 
     if checkpoint_dir:
-        _save_actor_checkpoints(agents, checkpoint_dir)
+        if shared_agent:
+            _save_shared_actor_checkpoint(next(iter(agents.values())), checkpoint_dir)
+        else:
+            _save_actor_checkpoints(agents, checkpoint_dir)
 
     summary = ExperimentSummary(
         mode=mode,
@@ -364,6 +440,12 @@ def _save_actor_checkpoints(agents: dict[int, SACAgent], out_dir: str) -> None:
         torch.save(agent.get_actor_state(), base / f"actor_robot_{rid}.pt")
 
 
+def _save_shared_actor_checkpoint(agent: SACAgent, out_dir: str) -> None:
+    base = Path(out_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    torch.save(agent.get_actor_state(), base / "actor_robot_0.pt")
+
+
 def _load_actor_checkpoints(agents: dict[int, SACAgent], in_dir: str) -> None:
     base = Path(in_dir)
     for rid, agent in agents.items():
@@ -372,3 +454,24 @@ def _load_actor_checkpoints(agents: dict[int, SACAgent], in_dir: str) -> None:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
         state_dict = torch.load(ckpt, map_location="cpu")
         agent.load_actor_state(state_dict)
+
+
+def _load_shared_actor_checkpoint(agent: SACAgent, in_dir: str) -> None:
+    base = Path(in_dir)
+    ckpt = base / "actor_robot_0.pt"
+    if not ckpt.exists():
+        files = sorted(base.glob("actor_robot_*.pt"))
+        if not files:
+            raise FileNotFoundError(f"No actor checkpoints found under: {base}")
+        ckpt = files[0]
+    state_dict = torch.load(ckpt, map_location="cpu")
+    agent.load_actor_state(state_dict)
+
+
+def _average_actor_state(agents: dict[int, SACAgent]) -> dict[str, torch.Tensor]:
+    ids = sorted(agents.keys())
+    states = [agents[rid].get_actor_state() for rid in ids]
+    out: dict[str, torch.Tensor] = {}
+    for k in states[0]:
+        out[k] = torch.stack([s[k] for s in states], dim=0).mean(dim=0)
+    return out
