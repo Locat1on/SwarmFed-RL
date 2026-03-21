@@ -59,12 +59,23 @@ def run_experiment(
     progress_every: int | None = None,
     shared_agent: bool = False,
     env_step_workers: int = 0,
+    weight_std_threshold: float | None = None,
+    comm_radius: float | None = None,
+    cooldown_steps: int | None = None,
+    exchange_interval_steps: int | None = None,
 ) -> ExperimentSummary:
     if mode not in {"local", "centralized", "p2p"}:
         raise ValueError(f"Unsupported mode: {mode}")
     malicious_nodes = malicious_nodes or set()
 
-    cfg = build_config(seed=seed, max_timesteps=max_timesteps)
+    cfg = build_config(
+        seed=seed,
+        max_timesteps=max_timesteps,
+        comm_radius=comm_radius,
+        cooldown_steps=cooldown_steps,
+        exchange_interval_steps=exchange_interval_steps,
+        weight_std_threshold=weight_std_threshold,
+    )
     set_global_seed(cfg.seed)
     configure_torch_runtime(enable_tf32=cfg.sac.enable_tf32)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,6 +96,10 @@ def run_experiment(
                 "attack_start_step": attack_start_step,
                 "shared_agent": shared_agent,
                 "env_step_workers": env_step_workers,
+                "weight_std_threshold": weight_std_threshold,
+                "comm_radius": comm_radius,
+                "cooldown_steps": cooldown_steps,
+                "exchange_interval_steps": exchange_interval_steps,
             },
         )
 
@@ -126,24 +141,32 @@ def run_experiment(
             raise RuntimeError("TensorBoard support is unavailable; install tensorboard package.")
         tb_writer = SummaryWriter(log_dir=tensorboard_log_dir)
     step_executor = None
-    if shared_agent and env_step_workers > 1:
+    if env_step_workers > 1:
         step_executor = ThreadPoolExecutor(max_workers=env_step_workers)
 
     try:
         for step in range(cfg.max_timesteps):
             positions: dict[int, np.ndarray] = {}
             step_reward = 0.0
-            batch_actions_by_rid: dict[int, np.ndarray] = {}
+            actions_by_rid: dict[int, np.ndarray] = {}
             if shared_agent:
                 shared = next(iter(agents.values()))
                 rid_list = list(range(num_robots))
                 state_batch = np.stack([states[rid] for rid in rid_list], axis=0).astype(np.float32)
                 action_batch = shared.select_actions(state_batch, deterministic=False)
-                batch_actions_by_rid = {rid: action_batch[i] for i, rid in enumerate(rid_list)}
+                actions_by_rid = {rid: action_batch[i] for i, rid in enumerate(rid_list)}
+            else:
+                actions_by_rid = {
+                    rid: agents[rid].select_action(states[rid], deterministic=False) for rid in range(num_robots)
+                }
 
-            if shared_agent and step_executor is not None:
+            if step_executor is not None:
                 step_futures = {
-                    rid: step_executor.submit(envs[rid].step, batch_actions_by_rid[rid]) for rid in range(num_robots)
+                    rid: step_executor.submit(
+                        envs[rid].step,
+                        actions_by_rid[rid],
+                    )
+                    for rid in range(num_robots)
                 }
                 step_outputs = {rid: fut.result() for rid, fut in step_futures.items()}
             else:
@@ -153,7 +176,7 @@ def run_experiment(
                 agent = agents[rid]
                 env = envs[rid]
                 state = states[rid]
-                action = batch_actions_by_rid[rid] if shared_agent else agent.select_action(state, deterministic=False)
+                action = actions_by_rid[rid]
                 if step_outputs:
                     next_state, reward, done, info = step_outputs[rid]
                 else:
@@ -179,7 +202,7 @@ def run_experiment(
             if shared_agent:
                 shared_ref = next(iter(agents.values()))
                 shared_ref.train_step()
-                shared_state = shared_ref.get_actor_state()
+                shared_state = shared_ref.get_actor_state(cpu_clone=False)
                 for sa in shadow_agents.values():
                     sa.load_actor_state(shared_state)
                 if mode == "p2p":
@@ -197,12 +220,12 @@ def run_experiment(
                         attack_start_step=attack_start_step,
                     )
                     comm_bytes = p2p.bytes_transferred
-                    shadow_mean = _average_actor_state(shadow_agents)
+                    shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
                     shared_ref.load_actor_state(shadow_mean)
                 elif mode == "centralized":
                     exchanges += centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
                     comm_bytes = centralized.bytes_transferred
-                    shadow_mean = _average_actor_state(shadow_agents)
+                    shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
                     shared_ref.load_actor_state(shadow_mean)
                 else:
                     comm_bytes = 0
@@ -468,9 +491,13 @@ def _load_shared_actor_checkpoint(agent: SACAgent, in_dir: str) -> None:
     agent.load_actor_state(state_dict)
 
 
-def _average_actor_state(agents: dict[int, SACAgent]) -> dict[str, torch.Tensor]:
+def _average_actor_state(
+    agents: dict[int, SACAgent],
+    *,
+    cpu_clone: bool = True,
+) -> dict[str, torch.Tensor]:
     ids = sorted(agents.keys())
-    states = [agents[rid].get_actor_state() for rid in ids]
+    states = [agents[rid].get_actor_state(cpu_clone=cpu_clone) for rid in ids]
     out: dict[str, torch.Tensor] = {}
     for k in states[0]:
         out[k] = torch.stack([s[k] for s in states], dim=0).mean(dim=0)

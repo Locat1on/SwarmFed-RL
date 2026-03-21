@@ -82,6 +82,7 @@ def build_config(
     comm_radius: float | None = None,
     cooldown_steps: int | None = None,
     exchange_interval_steps: int | None = None,
+    weight_std_threshold: float | None = None,
 ) -> ExperimentConfig:
     base = ExperimentConfig()
     seed_cfg = SeedConfig(
@@ -97,7 +98,11 @@ def build_config(
             if exchange_interval_steps is not None
             else base.p2p.exchange_interval_steps
         ),
-        weight_std_threshold=base.p2p.weight_std_threshold,
+        weight_std_threshold=(
+            weight_std_threshold
+            if weight_std_threshold is not None
+            else base.p2p.weight_std_threshold
+        ),
     )
     return ExperimentConfig(
         state_dim=base.state_dim,

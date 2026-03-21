@@ -166,7 +166,7 @@ class P2PAggregator:
 
         malicious_nodes = malicious_nodes or set()
         ids = sorted(agents.keys())
-        current_states = {rid: agents[rid].get_actor_state() for rid in ids}
+        current_states = {rid: agents[rid].get_actor_state(cpu_clone=False) for rid in ids}
         payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0

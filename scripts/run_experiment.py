@@ -53,7 +53,11 @@ def main() -> None:
     parser.add_argument("--config-snapshot", type=str, default=None)
     parser.add_argument("--progress-every", type=int, default=500)
     parser.add_argument("--shared-agent", action="store_true", help="Use one shared policy for all robots (faster throughput)")
-    parser.add_argument("--env-step-workers", type=int, default=0, help="Parallel env.step workers (used in shared-agent mode)")
+    parser.add_argument("--env-step-workers", type=int, default=0, help="Parallel env.step workers (applies to both strict and shared modes)")
+    parser.add_argument("--weight-std-threshold", type=float, default=0.01, help="Std threshold for counting/exchanging significant actor weights")
+    parser.add_argument("--comm-radius", type=float, default=None, help="P2P communication radius override")
+    parser.add_argument("--cooldown-steps", type=int, default=None, help="P2P cooldown steps override")
+    parser.add_argument("--exchange-interval-steps", type=int, default=None, help="P2P exchange interval override")
     parser.add_argument("--run-name", type=str, default=None, help="Name of the run (default: auto-generated)")
     parser.add_argument("--artifact-root", type=str, default="artifacts", help="Root directory for artifacts")
     args = parser.parse_args()
@@ -64,9 +68,6 @@ def main() -> None:
     if args.mode == "p2p" and args.shared_agent:
         print("Warning: Strict P2P experiment requires independent agents. Disabling --shared-agent for p2p.")
         args.shared_agent = False
-    if not args.shared_agent and args.env_step_workers > 0:
-        print("Warning: --env-step-workers only applies with --shared-agent. Ignoring.")
-        args.env_step_workers = 0
     
     # --- Artifact Path Logic ---
     root = Path(args.artifact_root)
@@ -174,6 +175,10 @@ def main() -> None:
                 progress_every=args.progress_every,
                 shared_agent=args.shared_agent,
                 env_step_workers=args.env_step_workers,
+                weight_std_threshold=args.weight_std_threshold,
+                comm_radius=args.comm_radius,
+                cooldown_steps=args.cooldown_steps,
+                exchange_interval_steps=args.exchange_interval_steps,
             )
             print(
                 "Experiment finished | "

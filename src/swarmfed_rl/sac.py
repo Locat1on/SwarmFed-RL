@@ -431,8 +431,10 @@ class SACAgent:
         for p, t in zip(source.parameters(), target.parameters()):
             t.data.copy_(tau * p.data + (1.0 - tau) * t.data)
 
-    def get_actor_state(self) -> dict[str, torch.Tensor]:
-        return {k: v.detach().cpu().clone() for k, v in self.actor.state_dict().items()}
+    def get_actor_state(self, *, cpu_clone: bool = True) -> dict[str, torch.Tensor]:
+        if cpu_clone:
+            return {k: v.detach().cpu().clone() for k, v in self.actor.state_dict().items()}
+        return {k: v.detach().clone() for k, v in self.actor.state_dict().items()}
 
     def load_actor_state(self, state_dict: dict[str, torch.Tensor]) -> None:
         self.actor.load_state_dict(state_dict)
