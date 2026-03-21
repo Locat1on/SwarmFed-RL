@@ -15,6 +15,9 @@ class RewardConfig:
     collision_penalty: float = -100.0
     progress_coeff: float = 10.0
     step_penalty: float = -0.5
+    danger_zone_distance: float = 0.5
+    proximity_penalty_coeff: float = 0.5
+    action_smoothness_coeff: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -26,14 +29,14 @@ class SACConfig:
     alpha_lr: float = 3e-4
     batch_size: int = 256
     buffer_size: int = 200_000
-    hidden_size: int = 256
+    hidden_size: int = 1024
     hidden_layers: int = 4
     residual: bool = True
     actor_encoder: str = "attention"  # attention | cnn | mlp
     actor_use_cnn: bool = True  # deprecated compatibility flag
-    attention_dim: int = 64
+    attention_dim: int = 128
     attention_heads: int = 4
-    attention_layers: int = 1
+    attention_layers: int = 3
     warmup_steps: int = 2_000
     update_after: int = 2_000
     update_every: int = 1
@@ -48,6 +51,7 @@ class P2PConfig:
     cooldown_steps: int = 50
     beta: float = 0.7
     exchange_interval_steps: int = 20
+    weight_std_threshold: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,7 @@ def build_config(
             if exchange_interval_steps is not None
             else base.p2p.exchange_interval_steps
         ),
+        weight_std_threshold=base.p2p.weight_std_threshold,
     )
     return ExperimentConfig(
         state_dim=base.state_dim,

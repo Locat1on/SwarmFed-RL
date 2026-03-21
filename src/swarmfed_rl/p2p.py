@@ -175,7 +175,7 @@ class P2PAggregator:
                 a, b = ids[i], ids[j]
                 if not self._can_exchange(step_idx, a, b, positions):
                     continue
-                payload_bytes = sum(v.numel() * v.element_size() for v in current_states[a].values())
+                payload_bytes = self._estimate_payload_bytes(current_states[a])
                 self.bytes_transferred += payload_bytes * 2
 
                 incoming_to_a = self._apply_attack(
@@ -226,6 +226,16 @@ class P2PAggregator:
             )
             agents[rid].load_actor_state(merged)
         return exchanges
+
+    def _estimate_payload_bytes(self, state: dict[str, torch.Tensor]) -> int:
+        threshold = max(0.0, float(self.cfg.weight_std_threshold))
+        estimated = 0
+        for k, v in state.items():
+            if float(torch.std(v).item()) > threshold:
+                estimated += v.numel() * v.element_size()
+        if estimated == 0:
+            return sum(v.numel() * v.element_size() for v in state.values())
+        return estimated
 
     def _can_exchange(
         self,

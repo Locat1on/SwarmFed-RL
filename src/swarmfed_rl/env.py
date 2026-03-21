@@ -33,6 +33,7 @@ class SimulatedROS2Env:
         self.state = RobotState(0.0, 0.0, 0.0, 0.0, 0.0)
         self.goal = np.zeros(2, dtype=np.float32)
         self.prev_distance = 0.0
+        self.last_action = np.zeros(2, dtype=np.float32)
         self.episode_steps = 0
         self.collisions = 0
         self.success = 0
@@ -51,6 +52,7 @@ class SimulatedROS2Env:
             dtype=np.float32,
         )
         self.prev_distance = self._distance_to_goal()
+        self.last_action = np.zeros(2, dtype=np.float32)
         self.episode_steps = 0
         return self._build_state()
 
@@ -68,6 +70,14 @@ class SimulatedROS2Env:
         current_distance = self._distance_to_goal()
         progress = self.prev_distance - current_distance
         reward = self.cfg.reward.progress_coeff * progress + self.cfg.reward.step_penalty
+        lidar = self._mock_lidar_24()
+        min_laser_dist = float(np.min(lidar))
+        if min_laser_dist < self.cfg.reward.danger_zone_distance:
+            danger_ratio = max(0.0, 1.0 - (min_laser_dist / self.cfg.reward.danger_zone_distance))
+            reward -= self.cfg.reward.proximity_penalty_coeff * danger_ratio
+        action_diff = float(np.linalg.norm(np.asarray([v, omega], dtype=np.float32) - self.last_action))
+        reward -= self.cfg.reward.action_smoothness_coeff * action_diff
+        self.last_action = np.asarray([v, omega], dtype=np.float32)
         done = False
         info: dict[str, float | bool] = {"collision": False, "success": False}
 
@@ -85,7 +95,9 @@ class SimulatedROS2Env:
             done = True
 
         self.prev_distance = current_distance
-        return self._build_state(), float(reward), done, info
+        tail = self._build_tail()
+        next_state = np.concatenate([lidar, tail], axis=0).astype(np.float32)
+        return next_state, float(reward), done, info
 
     def get_position(self) -> np.ndarray:
         return np.array([self.state.x, self.state.y], dtype=np.float32)
@@ -104,13 +116,16 @@ class SimulatedROS2Env:
 
     def _build_state(self) -> np.ndarray:
         lidar = self._mock_lidar_24()
+        tail = self._build_tail()
+        return np.concatenate([lidar, tail], axis=0).astype(np.float32)
+
+    def _build_tail(self) -> np.ndarray:
         goal_dx = float(self.goal[0] - self.state.x)
         goal_dy = float(self.goal[1] - self.state.y)
         dist = math.sqrt(goal_dx * goal_dx + goal_dy * goal_dy)
         goal_heading = math.atan2(goal_dy, goal_dx)
         heading_error = self._normalize_angle(goal_heading - self.state.yaw)
-        tail = np.array([self.state.v, self.state.omega, dist, heading_error], dtype=np.float32)
-        return np.concatenate([lidar, tail], axis=0).astype(np.float32)
+        return np.array([self.state.v, self.state.omega, dist, heading_error], dtype=np.float32)
 
     def _mock_lidar_24(self) -> np.ndarray:
         margin = self.world_size / 2.0

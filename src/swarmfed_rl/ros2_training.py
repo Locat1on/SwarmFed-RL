@@ -60,6 +60,7 @@ class _RobotContext:
     prev_distance: float
     episode_steps: int
     reset_manager: GazeboResetManager | None
+    last_action: np.ndarray
     received_bytes: int = 0
 
 
@@ -112,6 +113,7 @@ def run_ros2_experiment(options: ROS2RunnerOptions) -> ROS2RunSummary:  # pragma
                 prev_distance=_distance_to_goal(node.get_position_xy(), goal_xy),
                 episode_steps=0,
                 reset_manager=reset_manager,
+                last_action=np.zeros(2, dtype=np.float32),
             )
 
         step_dt = 1.0 / max(options.control_hz, 1e-6)
@@ -147,12 +149,15 @@ def run_ros2_experiment(options: ROS2RunnerOptions) -> ROS2RunSummary:  # pragma
                     goal_xy=ctx.goal_xy,
                     episode_steps=ctx.episode_steps + 1,
                     collision_scan_threshold=options.collision_scan_threshold,
+                    current_action=actions[rid],
+                    last_action=ctx.last_action,
                 )
                 norm_action = _normalize_action(actions[rid], cfg.action_low, cfg.action_high)
                 ctx.agent.buffer.push(current_states[rid], norm_action.astype(np.float32), reward, next_state, done)
                 ctx.agent.train_step()
 
                 ctx.episode_steps += 1
+                ctx.last_action = actions[rid].astype(np.float32)
                 ctx.prev_distance = _distance_to_goal(ctx.node.get_position_xy(), ctx.goal_xy)
                 if done:
                     episodes += 1
@@ -228,11 +233,18 @@ def _compute_reward_done(
     goal_xy: np.ndarray,
     episode_steps: int,
     collision_scan_threshold: float,
+    current_action: np.ndarray,
+    last_action: np.ndarray,
 ) -> tuple[float, bool, bool, bool]:
     current_distance = _distance_to_goal(node.get_position_xy(), goal_xy)
     progress = prev_distance - current_distance
     reward = cfg.reward.progress_coeff * progress + cfg.reward.step_penalty
-    is_collision = node.get_min_scan() <= collision_scan_threshold
+    min_scan = node.get_min_scan()
+    if min_scan < cfg.reward.danger_zone_distance:
+        danger_ratio = max(0.0, 1.0 - (min_scan / cfg.reward.danger_zone_distance))
+        reward -= cfg.reward.proximity_penalty_coeff * danger_ratio
+    reward -= cfg.reward.action_smoothness_coeff * float(np.linalg.norm(current_action - last_action))
+    is_collision = min_scan <= collision_scan_threshold
     is_success = current_distance <= cfg.goal_threshold
     done = False
     if is_collision:
@@ -274,3 +286,4 @@ def _reset_robot_episode(
     ctx.goal_xy = np.asarray(sample_safe_xy(rng=rng), dtype=np.float32)
     ctx.prev_distance = _distance_to_goal(ctx.node.get_position_xy(), ctx.goal_xy)
     ctx.episode_steps = 0
+    ctx.last_action = np.zeros(2, dtype=np.float32)

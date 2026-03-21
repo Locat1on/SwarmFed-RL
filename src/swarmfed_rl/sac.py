@@ -92,7 +92,7 @@ class RadarAttentionEncoder(nn.Module):
             dropout=0.0,
             activation="relu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
         self.out_proj = nn.Sequential(

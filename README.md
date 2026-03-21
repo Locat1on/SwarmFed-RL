@@ -151,6 +151,20 @@ artifacts/
 
 补充：已实现 Actor 自注意力编码器（Transformer Encoder），现在默认使用 `attention`。
 
+### 1.3) 奖励塑形与通信优化（已实现）
+
+- 奖励函数新增：
+  - 危险区接近惩罚（`danger_zone_distance` + `proximity_penalty_coeff`）
+  - 动作平滑惩罚（`action_smoothness_coeff`）
+- 已在本地仿真与 ROS2 训练回路同时接入。
+- 模型容量默认提升（适配高显存场景）：
+  - `hidden_size=1024`
+  - `attention_layers=3`
+  - `attention_dim=128`
+- P2P 通信统计新增“基于参数标准差阈值”的有效负载估计：
+  - `P2PConfig.weight_std_threshold=0.01`
+  - 优化通信开销评估口径，减少低变化参数对字节统计的影响。
+
 ### 2) ROS2 传感器 QoS 不匹配（已修复）
 
 - 问题：`/scan`、`/odom` 订阅使用默认可靠 QoS，可能收不到 SensorData(BestEffort)。
