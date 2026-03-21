@@ -18,7 +18,7 @@ from .config import build_config
 from .env import SimulatedROS2Env
 from .p2p import CentralizedFedAvg, P2PAggregator
 from .sac import SACAgent
-from .utils import set_global_seed
+from .utils import configure_torch_runtime, set_global_seed
 
 
 @dataclass
@@ -63,6 +63,7 @@ def run_experiment(
 
     cfg = build_config(seed=seed, max_timesteps=max_timesteps)
     set_global_seed(cfg.seed)
+    configure_torch_runtime(enable_tf32=cfg.sac.enable_tf32)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config_snapshot_path is not None:
         _save_config_snapshot(

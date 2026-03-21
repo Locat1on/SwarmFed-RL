@@ -39,10 +39,16 @@ class SACConfig:
     attention_layers: int = 3
     warmup_steps: int = 2_000
     update_after: int = 2_000
-    update_every: int = 1
+    update_every: int = 4
+    gradient_updates: int = 4
     log_std_min: float = -20.0
     log_std_max: float = 2.0
     grad_clip_norm: float = 5.0
+    use_amp: bool = True
+    amp_dtype: str = "bf16"  # bf16 | fp16
+    enable_tf32: bool = True
+    enable_torch_compile: bool = False
+    compile_mode: str = "reduce-overhead"
 
 
 @dataclass(frozen=True)

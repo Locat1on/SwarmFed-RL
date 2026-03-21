@@ -165,6 +165,16 @@ artifacts/
   - `P2PConfig.weight_std_threshold=0.01`
   - 优化通信开销评估口径，减少低变化参数对字节统计的影响。
 
+### 1.4) 5090 训练吞吐优化（已实现）
+
+- 训练侧新增（默认面向 CUDA 生效）：
+  - AMP 混合精度：`use_amp=True`, `amp_dtype=bf16|fp16`
+  - TF32：`enable_tf32=True`
+  - 批量更新调度：`update_every=4`, `gradient_updates=4`
+  - 可选 `torch.compile`：`enable_torch_compile`, `compile_mode`
+- 在 `experiment.py` 与 `ros2_training.py` 统一接入 `configure_torch_runtime()`。
+- CPU 回退兼容：在 CPU 上自动退化为每步单次更新，避免测试与行为回归。
+
 ### 2) ROS2 传感器 QoS 不匹配（已修复）
 
 - 问题：`/scan`、`/odom` 订阅使用默认可靠 QoS，可能收不到 SensorData(BestEffort)。

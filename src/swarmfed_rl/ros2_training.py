@@ -16,7 +16,7 @@ from .ros2_runtime import (
     sample_safe_xy,
 )
 from .sac import SACAgent
-from .utils import set_global_seed
+from .utils import configure_torch_runtime, set_global_seed
 
 try:  # pragma: no cover
     import rclpy
@@ -72,6 +72,7 @@ def run_ros2_experiment(options: ROS2RunnerOptions) -> ROS2RunSummary:  # pragma
 
     cfg = build_config(seed=options.seed, max_timesteps=options.max_timesteps)
     set_global_seed(cfg.seed)
+    configure_torch_runtime(enable_tf32=cfg.sac.enable_tf32)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rng = np.random.default_rng(options.seed)
 

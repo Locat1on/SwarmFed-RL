@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.amp import GradScaler, autocast
 from torch.distributions import Normal
 
 from .config import ExperimentConfig
@@ -284,6 +285,12 @@ class SACAgent:
         ).to(self.device)
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
+        if self.cfg.sac.enable_torch_compile and hasattr(torch, "compile"):
+            self.actor = torch.compile(self.actor, mode=self.cfg.sac.compile_mode)  # type: ignore[assignment]
+            self.q1 = torch.compile(self.q1, mode=self.cfg.sac.compile_mode)  # type: ignore[assignment]
+            self.q2 = torch.compile(self.q2, mode=self.cfg.sac.compile_mode)  # type: ignore[assignment]
+            self.q1_target = torch.compile(self.q1_target, mode=self.cfg.sac.compile_mode)  # type: ignore[assignment]
+            self.q2_target = torch.compile(self.q2_target, mode=self.cfg.sac.compile_mode)  # type: ignore[assignment]
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=self.cfg.sac.actor_lr)
         self.q1_opt = torch.optim.Adam(self.q1.parameters(), lr=self.cfg.sac.critic_lr)
@@ -291,6 +298,16 @@ class SACAgent:
         self.log_alpha = torch.tensor(0.0, device=self.device, requires_grad=True)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=self.cfg.sac.alpha_lr)
         self.target_entropy = -float(self.cfg.action_dim)
+        self.use_amp = bool(self.cfg.sac.use_amp and self.device.type == "cuda")
+        amp_dtype_raw = str(self.cfg.sac.amp_dtype).lower()
+        self.amp_dtype = torch.bfloat16 if amp_dtype_raw == "bf16" else torch.float16
+        self.autocast_device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        self.scaler = GradScaler("cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
+        self._train_call_count = 0
+        self.effective_update_every = max(1, self.cfg.sac.update_every if self.device.type == "cuda" else 1)
+        self.effective_gradient_updates = max(
+            1, self.cfg.sac.gradient_updates if self.device.type == "cuda" else 1
+        )
 
         self.buffer = ReplayBuffer(self.cfg.state_dim, self.cfg.action_dim, self.cfg.sac.buffer_size)
 
@@ -320,47 +337,68 @@ class SACAgent:
         return low + (tanh_action + 1.0) * (high - low) / 2.0
 
     def train_step(self) -> dict[str, float]:
+        self._train_call_count += 1
+        if self.buffer.size < max(self.cfg.sac.batch_size, self.cfg.sac.update_after):
+            return {}
+        if self._train_call_count % self.effective_update_every != 0:
+            return {}
+
+        last_metrics: dict[str, float] = {}
+        for _ in range(self.effective_gradient_updates):
+            last_metrics = self._train_step_once()
+        return last_metrics
+
+    def _train_step_once(self) -> dict[str, float]:
         if self.buffer.size < max(self.cfg.sac.batch_size, self.cfg.sac.update_after):
             return {}
 
         state, action, reward, next_state, done = self.buffer.sample(self.cfg.sac.batch_size, self.device)
 
         with torch.no_grad():
-            next_a, next_logp = self.actor.sample(next_state)
-            next_q = torch.min(
-                self.q1_target(next_state, next_a),
-                self.q2_target(next_state, next_a),
-            ) - self.alpha * next_logp
-            target_q = reward + (1.0 - done) * self.cfg.sac.gamma * next_q
+            with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
+                next_a, next_logp = self.actor.sample(next_state)
+                next_q = torch.min(
+                    self.q1_target(next_state, next_a),
+                    self.q2_target(next_state, next_a),
+                ) - self.alpha * next_logp
+                target_q = reward + (1.0 - done) * self.cfg.sac.gamma * next_q
 
-        q1_loss = F.mse_loss(self.q1(state, action), target_q)
-        q2_loss = F.mse_loss(self.q2(state, action), target_q)
+        with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
+            q1_loss = F.mse_loss(self.q1(state, action), target_q)
+            q2_loss = F.mse_loss(self.q2(state, action), target_q)
         self._safe_loss(q1_loss, "q1_loss")
         self._safe_loss(q2_loss, "q2_loss")
         self.q1_opt.zero_grad()
-        q1_loss.backward()
+        self.scaler.scale(q1_loss).backward()
+        self.scaler.unscale_(self.q1_opt)
         torch.nn.utils.clip_grad_norm_(self.q1.parameters(), self.cfg.sac.grad_clip_norm)
-        self.q1_opt.step()
-        self.q2_opt.zero_grad()
-        q2_loss.backward()
+        self.scaler.step(self.q1_opt)
+        self.q1_opt.zero_grad(set_to_none=True)
+        self.q2_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(q2_loss).backward()
+        self.scaler.unscale_(self.q2_opt)
         torch.nn.utils.clip_grad_norm_(self.q2.parameters(), self.cfg.sac.grad_clip_norm)
-        self.q2_opt.step()
+        self.scaler.step(self.q2_opt)
 
-        pi, logp = self.actor.sample(state)
-        q_pi = torch.min(self.q1(state, pi), self.q2(state, pi))
-        actor_loss = (self.alpha * logp - q_pi).mean()
+        with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
+            pi, logp = self.actor.sample(state)
+            q_pi = torch.min(self.q1(state, pi), self.q2(state, pi))
+            actor_loss = (self.alpha * logp - q_pi).mean()
         self._safe_loss(actor_loss, "actor_loss")
         self.actor_opt.zero_grad()
-        actor_loss.backward()
+        self.scaler.scale(actor_loss).backward()
+        self.scaler.unscale_(self.actor_opt)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.sac.grad_clip_norm)
-        self.actor_opt.step()
+        self.scaler.step(self.actor_opt)
 
-        alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+        with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
+            alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
         self._safe_loss(alpha_loss, "alpha_loss")
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
         torch.nn.utils.clip_grad_norm_([self.log_alpha], self.cfg.sac.grad_clip_norm)
         self.alpha_opt.step()
+        self.scaler.update()
 
         self._soft_update(self.q1, self.q1_target)
         self._soft_update(self.q2, self.q2_target)
