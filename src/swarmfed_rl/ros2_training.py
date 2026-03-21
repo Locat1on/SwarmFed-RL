@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -116,6 +115,8 @@ def run_ros2_experiment(options: ROS2RunnerOptions) -> ROS2RunSummary:  # pragma
             )
 
         step_dt = 1.0 / max(options.control_hz, 1e-6)
+        sim_clock = contexts[options.robot_ids[0]].node.get_clock()
+        step_dt_ns = int(step_dt * 1e9)
         episodes = 0
         successes = 0
         collisions = 0
@@ -132,8 +133,8 @@ def run_ros2_experiment(options: ROS2RunnerOptions) -> ROS2RunSummary:  # pragma
                 current_states[rid] = state
                 actions[rid] = action
 
-            deadline = time.time() + step_dt
-            while time.time() < deadline:
+            deadline_ns = sim_clock.now().nanoseconds + step_dt_ns
+            while sim_clock.now().nanoseconds < deadline_ns:
                 for ctx in contexts.values():
                     rclpy.spin_once(ctx.node, timeout_sec=0.001)
 

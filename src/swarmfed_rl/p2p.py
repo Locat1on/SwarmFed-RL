@@ -297,19 +297,9 @@ class P2PAggregator:
             incoming_mean = aggregate_state_dicts_trimmed_mean(
                 incoming_states, trim_ratio=defense_trim_ratio
             )
-            trim_k = int(len(candidates) * max(0.0, min(0.49, defense_trim_ratio)))
-            if trim_k <= 0 or len(candidates) <= 2:
-                used_idx = set(range(len(candidates)))
-            else:
-                agg_vec = state_dict_to_vector(incoming_mean)
-                dists = []
-                for idx, c in enumerate(candidates):
-                    d = float(torch.norm(state_dict_to_vector(c.state) - agg_vec, p=2).item())
-                    dists.append((d, idx))
-                dists.sort(key=lambda x: x[0])
-                kept = dists[: max(1, len(candidates) - trim_k)]
-                used_idx = {idx for _, idx in kept}
-            self._update_accept_reject_stats(candidates, used_idx)
+            # Trimmed-mean is element-wise; a sender may be partly used and partly trimmed.
+            # Record all senders as accepted at sender-level to avoid misleading "fully rejected" stats.
+            self._update_accept_reject_stats(candidates, set(range(len(candidates))))
             return self._blend(local_state, incoming_mean)
 
         # Krum: include local model as a candidate anchor for robust selection.
@@ -395,8 +385,9 @@ class CentralizedFedAvg:
     Baseline aggregator that averages all actor weights at fixed intervals.
     """
 
-    def __init__(self, interval_steps: int) -> None:
+    def __init__(self, interval_steps: int, beta: float) -> None:
         self.interval_steps = interval_steps
+        self.beta = beta
         self.bytes_transferred = 0
 
     def maybe_aggregate(self, step_idx: int, agents: dict[int, SACAgent]) -> int:
@@ -419,5 +410,16 @@ class CentralizedFedAvg:
         self.bytes_transferred += payload_one_way * (len(ids) * 2)
 
         for rid in ids:
-            agents[rid].load_actor_state(merged)
+            blended = self._blend(agents[rid].get_actor_state(), merged)
+            agents[rid].load_actor_state(blended)
         return 1
+
+    def _blend(
+        self,
+        local_state: dict[str, torch.Tensor],
+        incoming_state: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        for k in local_state:
+            out[k] = self.beta * local_state[k] + (1.0 - self.beta) * incoming_state[k]
+        return out

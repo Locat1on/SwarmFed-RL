@@ -116,8 +116,8 @@ def generate_launch_description():
                         'publish_frequency': 5.0 # Low frequency for swarm performance
                     }],
                     remappings=[
-                        ('/tf', 'tf'),
-                        ('/tf_static', 'tf_static')
+                        ('tf', '/tf'),
+                        ('tf_static', '/tf_static')
                     ]
                 )
                 actions.append(TimerAction(period=delay, actions=[spawn_cmd, rsp_cmd]))

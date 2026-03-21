@@ -90,7 +90,7 @@ def run_experiment(
         _load_actor_checkpoints(agents, load_checkpoint_dir)
 
     p2p = P2PAggregator(cfg.p2p)
-    centralized = CentralizedFedAvg(interval_steps=cfg.p2p.exchange_interval_steps)
+    centralized = CentralizedFedAvg(interval_steps=cfg.p2p.exchange_interval_steps, beta=cfg.p2p.beta)
 
     episodes = 0
     successes = 0

@@ -17,12 +17,14 @@ try:  # pragma: no cover
     from geometry_msgs.msg import Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
+    from rclpy.parameter import Parameter
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import LaserScan
     from std_msgs.msg import ByteMultiArray
 except ImportError:  # pragma: no cover
     rclpy = None
     Node = object  # type: ignore[assignment]
+    Parameter = None  # type: ignore[assignment]
     qos_profile_sensor_data = None  # type: ignore[assignment]
     LaserScan = object  # type: ignore[assignment]
     Odometry = object  # type: ignore[assignment]
@@ -350,6 +352,8 @@ class ROS2RLNode(Node):  # pragma: no cover
         if rclpy is None:
             raise RuntimeError("rclpy is not available in this environment")
         super().__init__(node_name)
+        # Keep control loop aligned with Gazebo /clock time when available.
+        self.set_parameters([Parameter("use_sim_time", value=True)])
         self.robot_id = robot_id
         self._scan_ranges: list[float] | None = None
         self._linear_v = 0.0
