@@ -189,6 +189,10 @@ def run_experiment(
             positions: dict[int, np.ndarray] = {}
             step_reward = 0.0
             actions_by_rid: dict[int, np.ndarray] = {}
+            # Ensure previous async exchange is done before touching agent networks
+            if not shared_agent and exchange_future is not None and not exchange_future.done():
+                exchanges += exchange_future.result()
+                exchange_future = None
             if shared_agent:
                 shared = next(iter(agents.values()))
                 rid_list = list(range(num_robots))
