@@ -436,6 +436,7 @@ def run_experiment(
                     buffer_capacity = sample_agent.buffer.capacity if hasattr(sample_agent.buffer, 'capacity') else sample_agent.cfg.sac.buffer_size
                     buffer_usage_pct = (buffer_size / buffer_capacity * 100) if buffer_capacity > 0 else 0
                     
+                    train_label = "train" if shared_agent else f"train(r{rid_to_train})"
                     print(
                         f"[{mode}] step={current_step}/{cfg.max_timesteps} | "
                         f"eps={episodes} rew={cumulative_reward:.2f} "
@@ -443,7 +444,7 @@ def run_experiment(
                         f"exch={exchanges} bytes={comm_bytes/1e6:.1f}MB | "
                         f"speed={steps_per_sec:.2f}step/s ({elapsed_since_last:.1f}s) | "
                         f"buf={buffer_usage_pct:.0f}% | "
-                        f"time: env={env_pct:.0f}% train={train_pct:.0f}% p2p={exchange_pct:.0f}%",
+                        f"time: env={env_pct:.0f}% {train_label}={train_pct:.0f}% p2p={exchange_pct:.0f}%",
                         flush=True,
                     )
                     last_log_time = now
