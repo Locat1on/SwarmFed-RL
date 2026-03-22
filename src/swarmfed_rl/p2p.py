@@ -194,15 +194,15 @@ class P2PAggregator:
         defense_krum_malicious: int = 1,
         calibration_steps: int = 0,
         attack_start_step: int = 0,
-    ) -> int:
+    ) -> tuple[int, dict[int, dict[str, torch.Tensor]]]:
         if step_idx % self.cfg.exchange_interval_steps != 0:
-            return 0
+            return 0, {}
         if defense_strategy not in {"cosine", "trimmed_mean", "krum"}:
             raise ValueError(f"Unsupported defense strategy: {defense_strategy}")
 
         malicious_nodes = malicious_nodes or set()
         ids = sorted(agents.keys())
-        current_states = {rid: agents[rid].get_actor_state(cpu_clone=False) for rid in ids}
+        current_states = {rid: agents[rid].get_actor_state(cpu_clone=True) for rid in ids}
         
         # FP16 quantization for communication
         if self.cfg.use_fp16_comm:

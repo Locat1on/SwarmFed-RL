@@ -285,9 +285,9 @@ def run_experiment(
                 total_env_time += (env_step_end - env_step_start)
 
                 # 3. Synchronize Exchange BEFORE Training
-                # We must ensure any background weights updates are fully merged before 
+                # We must ensure any background weights updates are fully merged before
                 # calculating new gradients to prevent state corruption.
-                exchange_start = time.time()
+                exchange_sync_start = time.time()
                 if exchange_future is not None and exchange_future.done():
                     res, merged_states = exchange_future.result()
                     exchanges += res
@@ -322,6 +322,9 @@ def run_experiment(
                         for rid, state in merged_states.items():
                             agents[rid].load_actor_state(state)
 
+                exchange_sync_end = time.time()
+                total_exchange_time += (exchange_sync_end - exchange_sync_start)
+
                 # 4. Training
                 train_start = time.time()
                 log_metrics_this_step = (step % 100 == 0)
@@ -341,6 +344,7 @@ def run_experiment(
                 total_train_time += (train_end - train_start)
                 
                 # 5. Initiate new P2P exchange
+                exchange_init_start = time.time()
                 progress = step / cfg.max_timesteps
                 comm_bytes = 0
                 if step % cfg.p2p.exchange_interval_steps == 0:
@@ -363,7 +367,7 @@ def run_experiment(
                                     attack_start_step=attack_start_step,
                                 )
                             else:
-                                res = p2p.maybe_exchange(
+                                res, merged_states = p2p.maybe_exchange(
                                     step_idx=step,
                                     agents=shadow_agents,
                                     positions=positions,
@@ -379,6 +383,8 @@ def run_experiment(
                                 )
                                 exchanges += res
                                 epoch_exchanges += res
+                                for rid, state in merged_states.items():
+                                    shadow_agents[rid].load_actor_state(state)
                                 shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
                                 shared_ref = next(iter(agents.values()))
                                 shared_ref.load_actor_state(shadow_mean)
@@ -392,9 +398,11 @@ def run_experiment(
                                     agents=shadow_agents,
                                 )
                             else:
-                                res = centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
+                                res, merged_states = centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
                                 exchanges += res
                                 epoch_exchanges += res
+                                for rid, state in merged_states.items():
+                                    shadow_agents[rid].load_actor_state(state)
                                 shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
                                 shared_ref = next(iter(agents.values()))
                                 shared_ref.load_actor_state(shadow_mean)
@@ -418,7 +426,7 @@ def run_experiment(
                                 attack_start_step=attack_start_step,
                             )
                         else:
-                            res = p2p.maybe_exchange(
+                            res, merged_states = p2p.maybe_exchange(
                                 step_idx=step,
                                 agents=agents,
                                 positions=positions,
@@ -434,6 +442,8 @@ def run_experiment(
                             )
                             exchanges += res
                             epoch_exchanges += res
+                            for rid, state in merged_states.items():
+                                agents[rid].load_actor_state(state)
                         comm_bytes = p2p.bytes_transferred
                     elif mode == "centralized":
                         if cfg.p2p.async_exchange:
@@ -443,9 +453,11 @@ def run_experiment(
                                 agents=agents,
                             )
                         else:
-                            res = centralized.maybe_aggregate(step_idx=step, agents=agents)
+                            res, merged_states = centralized.maybe_aggregate(step_idx=step, agents=agents)
                             exchanges += res
                             epoch_exchanges += res
+                            for rid, state in merged_states.items():
+                                agents[rid].load_actor_state(state)
                         comm_bytes = centralized.bytes_transferred
                 else:
                     # Update comm_bytes for logging even on non-exchange steps
@@ -454,8 +466,8 @@ def run_experiment(
                     elif mode == "centralized":
                         comm_bytes = centralized.bytes_transferred
                 
-                exchange_end = time.time()
-                total_exchange_time += (exchange_end - exchange_start)
+                exchange_init_end = time.time()
+                total_exchange_time += (exchange_init_end - exchange_init_start)
 
                 cumulative_reward += step_reward
                 epoch_reward += step_reward
@@ -547,7 +559,8 @@ def run_experiment(
         
         # Finalize any pending async exchanges
         if exchange_future is not None and not exchange_future.done():
-            exchanges += exchange_future.result()
+            res, _merged = exchange_future.result()
+            exchanges += res
             
     finally:
         if csv_file is not None:
