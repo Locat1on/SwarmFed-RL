@@ -413,6 +413,9 @@ class SACAgent:
         last_metrics: dict[str, float] = {}
         for _ in range(self.effective_gradient_updates):
             last_metrics = self._train_step_once()
+        self.scaler.update()
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
         return last_metrics
 
     def _train_step_once(self) -> dict[str, float]:
@@ -472,10 +475,8 @@ class SACAgent:
             torch.nn.utils.clip_grad_norm_([self.log_alpha], self.cfg.sac.grad_clip_norm)
             self.alpha_opt.step()
 
-        self.scaler.update()
-
-        self._soft_update(self.q1, self.q1_target)
-        self._soft_update(self.q2, self.q2_target)
+        # scaler.update() and soft_update moved to train_step() to avoid
+        # redundant calls during gradient accumulation loop
 
         return {
             "q1_loss": float(q1_loss.item()),

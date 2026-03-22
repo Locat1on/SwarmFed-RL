@@ -289,6 +289,129 @@ python scripts/run_experiment.py \
 - FP32 baseline: 38,236,160 bytes
 - FP16 优化: 19,118,080 bytes（**减少50%** ✅）
 
+---
+
+## 性能调优与故障排除
+
+### P2P通信过于频繁（P2P占比>20%）
+
+**症状**：日志显示 `time: p2p=22%` 或更高，`exch=4000+`/2000步
+
+**诊断**：
+```bash
+# 查看最新日志
+tail -1 artifacts/logs/p2p/your_run.log
+# 如果 p2p > 15% 且 exch/step > 1.5，说明通信过于频繁
+```
+
+**方案A：推荐修复（降低通信频率）**
+
+```bash
+python scripts/run_experiment.py \
+    --mode p2p \
+    --robots 30 \
+    --timesteps 20000 \
+    --env-step-workers 8 \
+    --exchange-interval-steps 100 \
+    --cooldown-steps 200 \
+    --weight-std-threshold 0.05 \
+    --grid-cell-size 2.0 \
+    --frame-stack 4 \
+    --gpu-replay-buffer \
+    --actor-update-interval 2 \
+    --layer-diff-threshold 0.001 \
+    --comm-radius 1.5 \
+    --run-name p2p_30r_fixed \
+    --progress-every 2000
+```
+
+**预期改善**：P2P从22%降至5-8%，速度提升2-3x
+
+**方案B：激进优化（极速模式）**
+
+```bash
+python scripts/run_experiment.py \
+    --mode p2p \
+    --robots 30 \
+    --timesteps 20000 \
+    --env-step-workers 8 \
+    --exchange-interval-steps 200 \
+    --cooldown-steps 400 \
+    --weight-std-threshold 0.1 \
+    --grid-cell-size 3.0 \
+    --frame-stack 4 \
+    --gpu-replay-buffer \
+    --actor-update-interval 2 \
+    --layer-diff-threshold 0.005 \
+    --comm-radius 1.2 \
+    --run-name p2p_30r_aggressive \
+    --progress-every 2000
+```
+
+**预期改善**：P2P降至2-5%，速度提升3-4x
+
+---
+
+### GPU利用率低（train占比<30%，env占比>60%）
+
+**症状**：`time: env=70% train=15%`
+
+**解决方案**：
+```bash
+# 增加并行环境worker充分利用CPU
+python scripts/run_experiment.py \
+    --mode p2p \
+    --robots 30 \
+    --timesteps 20000 \
+    --env-step-workers 16 \
+    --exchange-interval-steps 100 \
+    --run-name p2p_more_workers
+```
+
+---
+
+### 训练越来越慢
+
+**诊断**：观察日志中 `speed=` 是否递减
+```bash
+grep "step=" artifacts/logs/p2p/your_run.log | grep -E "step=(2000|4000|6000|8000)"
+```
+
+**常见原因与解决**：
+1. **P2P通信量增长** → 使用上面的方案A/B
+2. **内存泄漏** → 更新到最新代码（已修复）
+3. **Buffer采样变慢** → 启用 `--gpu-replay-buffer`
+
+---
+
+### 快速性能对比测试
+
+```bash
+# Baseline（禁用优化）
+python scripts/run_experiment.py \
+    --mode p2p --robots 30 --timesteps 2000 \
+    --env-step-workers 0 \
+    --disable-fp16-comm --disable-async-exchange \
+    --actor-update-interval 1 --layer-diff-threshold 0 \
+    --exchange-interval-steps 40 \
+    --run-name baseline --progress-every 500
+
+# 完全优化
+python scripts/run_experiment.py \
+    --mode p2p --robots 30 --timesteps 2000 \
+    --env-step-workers 8 \
+    --exchange-interval-steps 100 --cooldown-steps 200 \
+    --comm-radius 1.5 --gpu-replay-buffer \
+    --actor-update-interval 2 --layer-diff-threshold 0.001 \
+    --run-name optimized --progress-every 500
+
+# 对比速度
+grep "step=2000" artifacts/logs/p2p/baseline.log
+grep "step=2000" artifacts/logs/p2p/optimized.log
+```
+
+---
+
 ## 性能模式（5090推荐）
 
 若你追求吞吐而非“严格 P2P 实验”：
@@ -313,11 +436,37 @@ python scripts/run_experiment.py --mode p2p --robots 30 --timesteps 20000 --prog
 
 ## 常见问题
 
+### 性能相关
+
+- **P2P通信占比过高（>20%）？**  
+  参见上方"性能调优与故障排除"章节的方案A/B，大幅降低 `exchange-interval-steps` 和 `cooldown-steps`。
+
+- **训练越来越慢？**  
+  使用 `grep "step=" your_log.log` 查看速度趋势。如果持续下降，检查 P2P 时间占比或更新代码（已修复内存泄漏）。
+
+- **GPU利用率低？**  
+  增加 `--env-step-workers` 充分利用CPU多核，或启用 `--gpu-replay-buffer`。
+
+### 训练相关
+
 - **Reward 一直是负的？**  
   训练初期常见。每步惩罚 + 碰撞惩罚会压低总奖励。请看 `episode_return_mean` 和成功率/碰撞率趋势，而不是只看累计和。
 
 - **30 台机器人会不会太卡？**  
   真实 ROS2/Gazebo 常见瓶颈在 CPU 仿真与通信。建议先 headless、降低传感器频率、控制日志频率。
+
+### 日志解读
+
+- **如何看懂新版日志？**  
+  ```
+  [p2p] step=2000/20000 | eps=125 rew=-1523.4 succ=12 coll=8 | 
+        exch=145 bytes=38.2MB | speed=12.34step/s (162.0s) | buf=65% | 
+        time: env=45% train=35% p2p=15%
+  ```
+  - `speed`: 当前训练速度（step/s）
+  - `buf`: Replay Buffer填充率
+  - `time`: 时间分布（env=环境交互，train=SAC训练，p2p=通信聚合）
+  - 理想状态：`env 40-50%`, `train 30-40%`, `p2p <10%`
 
 - **如何退出 ROS2 launch 卡住？**  
   若多次 `Ctrl+C` 不退出，另开终端按 PID 精确结束进程（避免按进程名批量杀）。

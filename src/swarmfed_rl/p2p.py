@@ -144,19 +144,15 @@ def krum_select_index(vectors: list[torch.Tensor], malicious_count: int) -> int:
     if neighbor_count < 1:
         neighbor_count = 1
 
-    distances = torch.zeros((n, n), dtype=torch.float32)
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = torch.norm(vectors[i] - vectors[j], p=2)
-            distances[i, j] = d
-            distances[j, i] = d
-    scores = []
-    for i in range(n):
-        others = torch.cat([distances[i, :i], distances[i, i + 1 :]], dim=0)
-        nearest, _ = torch.sort(others)
-        score = torch.sum(nearest[:neighbor_count])
-        scores.append(float(score.item()))
-    return int(np.argmin(scores))
+    stacked = torch.stack(vectors)  # (n, d)
+    distances = torch.cdist(stacked.unsqueeze(0), stacked.unsqueeze(0)).squeeze(0)
+    # Mask diagonal (self-distance = 0) with inf so it's excluded from topk
+    distances.fill_diagonal_(float("inf"))
+    # Use topk to find nearest neighbors (faster than full sort)
+    k = min(neighbor_count, n - 1)
+    nearest_dists, _ = torch.topk(distances, k, dim=1, largest=False)
+    scores = nearest_dists.sum(dim=1)
+    return int(torch.argmin(scores).item())
 
 
 class P2PAggregator:
@@ -233,8 +229,8 @@ class P2PAggregator:
                 
                 # Selective layer filtering if enabled
                 if self.cfg.layer_diff_threshold > 0:
-                    local_a_fp16 = quantize_state_fp16(agents[a].get_actor_state(cpu_clone=False)) if self.cfg.use_fp16_comm else agents[a].get_actor_state(cpu_clone=False)
-                    local_b_fp16 = quantize_state_fp16(agents[b].get_actor_state(cpu_clone=False)) if self.cfg.use_fp16_comm else agents[b].get_actor_state(cpu_clone=False)
+                    local_a_fp16 = current_states[a]
+                    local_b_fp16 = current_states[b]
                     incoming_to_a_filtered = selective_layer_filter(local_a_fp16, incoming_to_a, self.cfg.layer_diff_threshold)
                     incoming_to_b_filtered = selective_layer_filter(local_b_fp16, incoming_to_b, self.cfg.layer_diff_threshold)
                     # Update local state with filtered incoming

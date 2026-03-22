@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,7 +159,7 @@ def run_experiment(
     exchanges = 0
     cumulative_reward = 0.0
     current_ep_rewards = {rid: 0.0 for rid in range(num_robots)}
-    completed_ep_returns: list[float] = []
+    completed_ep_returns: deque[float] = deque(maxlen=1000)
     csv_file, csv_writer = _open_csv_writer(log_csv_path)
     tb_writer = None
     if tensorboard_log_dir:
@@ -234,9 +235,6 @@ def run_experiment(
                 if done:
                     episodes += 1
                     completed_ep_returns.append(current_ep_rewards[rid])
-                    # Limit list size to prevent memory growth
-                    if len(completed_ep_returns) > 1000:
-                        completed_ep_returns.pop(0)
                     current_ep_rewards[rid] = 0.0
                 if bool(info["success"]):
                     successes += 1
@@ -251,9 +249,11 @@ def run_experiment(
             if shared_agent:
                 shared_ref = next(iter(agents.values()))
                 shared_ref.train_step()
-                shared_state = shared_ref.get_actor_state(cpu_clone=False)
-                for sa in shadow_agents.values():
-                    sa.load_actor_state(shared_state)
+                # Only sync shadow agents on exchange steps to avoid per-step cloning overhead
+                if mode in {"p2p", "centralized"} and step % cfg.p2p.exchange_interval_steps == 0:
+                    shared_state = shared_ref.get_actor_state(cpu_clone=False)
+                    for sa in shadow_agents.values():
+                        sa.load_actor_state(shared_state)
                 
             train_end = time.time()
             total_train_time += (train_end - train_start)
@@ -374,40 +374,42 @@ def run_experiment(
             iter_time = iter_end - iter_start
             steps_since_last_log += 1
             
-            _write_step_row(
-                csv_writer=csv_writer,
-                file_handle=csv_file,
-                step=step + 1,
-                mode=mode,
-                defense_enabled=defense_enabled,
-                step_reward=step_reward,
-                cumulative_reward=cumulative_reward,
-                episodes=episodes,
-                successes=successes,
-                collisions=collisions,
-                exchanges=exchanges,
-                communication_bytes=comm_bytes,
-                defense_accepted=p2p.defense_stats.accepted_updates,
-                defense_rejected=p2p.defense_stats.rejected_updates,
-                defense_rejected_malicious=p2p.defense_stats.rejected_malicious_updates,
-                defense_accepted_malicious=p2p.defense_stats.accepted_malicious_updates,
-                episode_return_mean=episode_return_mean,
-            )
-            _write_tb(
-                writer=tb_writer,
-                step=step + 1,
-                step_reward=step_reward,
-                cumulative_reward=cumulative_reward,
-                episodes=episodes,
-                successes=successes,
-                collisions=collisions,
-                exchanges=exchanges,
-                communication_bytes=comm_bytes,
-                defense_accepted=p2p.defense_stats.accepted_updates,
-                defense_rejected=p2p.defense_stats.rejected_updates,
-                episode_return_mean=episode_return_mean,
-                latest_episode_return=latest_episode_return,
-            )
+            # Write metrics every 10 steps to reduce I/O overhead
+            if step % 10 == 0 or step == cfg.max_timesteps - 1:
+                _write_step_row(
+                    csv_writer=csv_writer,
+                    file_handle=csv_file,
+                    step=step + 1,
+                    mode=mode,
+                    defense_enabled=defense_enabled,
+                    step_reward=step_reward,
+                    cumulative_reward=cumulative_reward,
+                    episodes=episodes,
+                    successes=successes,
+                    collisions=collisions,
+                    exchanges=exchanges,
+                    communication_bytes=comm_bytes,
+                    defense_accepted=p2p.defense_stats.accepted_updates,
+                    defense_rejected=p2p.defense_stats.rejected_updates,
+                    defense_rejected_malicious=p2p.defense_stats.rejected_malicious_updates,
+                    defense_accepted_malicious=p2p.defense_stats.accepted_malicious_updates,
+                    episode_return_mean=episode_return_mean,
+                )
+                _write_tb(
+                    writer=tb_writer,
+                    step=step + 1,
+                    step_reward=step_reward,
+                    cumulative_reward=cumulative_reward,
+                    episodes=episodes,
+                    successes=successes,
+                    collisions=collisions,
+                    exchanges=exchanges,
+                    communication_bytes=comm_bytes,
+                    defense_accepted=p2p.defense_stats.accepted_updates,
+                    defense_rejected=p2p.defense_stats.rejected_updates,
+                    episode_return_mean=episode_return_mean,
+                    latest_episode_return=latest_episode_return,
+                )
             if progress_every is not None and progress_every > 0:
                 current_step = step + 1
                 if current_step == 1 or current_step % progress_every == 0 or current_step == cfg.max_timesteps:
