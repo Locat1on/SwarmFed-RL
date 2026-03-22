@@ -249,8 +249,10 @@ def run_experiment(
             # Training and exchange
             train_start = time.time()
             if not shared_agent:
-                for rid in range(num_robots):
-                    agents[rid].train_step()
+                # Staggered training: each step only train one agent (round-robin)
+                # Over num_robots steps every agent trains once, ~N× faster
+                rid_to_train = step % num_robots
+                agents[rid_to_train].train_step()
             if shared_agent:
                 shared_ref = next(iter(agents.values()))
                 shared_ref.train_step()
