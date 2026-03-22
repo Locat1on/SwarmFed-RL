@@ -249,10 +249,15 @@ def run_experiment(
             # Training and exchange
             train_start = time.time()
             if not shared_agent:
-                # Staggered training: each step only train one agent (round-robin)
-                # Over num_robots steps every agent trains once, ~N× faster
+                # Staggered training: each step only train one agent (round-robin).
+                # Call train_step() num_robots times so _train_call_count grows
+                # at the same rate as non-staggered mode, keeping update_every /
+                # gradient_updates / update_after semantics unchanged.
+                # Total gradient updates per step stays the same, but all on one
+                # network → better GPU cache utilization.
                 rid_to_train = step % num_robots
-                agents[rid_to_train].train_step()
+                for _ in range(num_robots):
+                    agents[rid_to_train].train_step()
             if shared_agent:
                 shared_ref = next(iter(agents.values()))
                 shared_ref.train_step()
