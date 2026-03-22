@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -516,6 +517,7 @@ class CentralizedFedAvg:
         self.interval_steps = interval_steps
         self.beta = beta
         self.bytes_transferred = 0
+        self._lock = threading.Lock()
 
     def maybe_aggregate(self, step_idx: int, agents: dict[int, SACAgent]) -> tuple[int, dict[int, dict[str, torch.Tensor]]]:
         if step_idx % self.interval_steps != 0:
@@ -534,7 +536,9 @@ class CentralizedFedAvg:
         payload_one_way = 0
         for k in merged:
             payload_one_way += merged[k].numel() * merged[k].element_size()
-        self.bytes_transferred += payload_one_way * (len(ids) * 2)
+        
+        with self._lock:
+            self.bytes_transferred += payload_one_way * (len(ids) * 2)
 
         merged_states = {}
         for rid in ids:
