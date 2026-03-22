@@ -1,3 +1,11 @@
+"""P2P federated aggregation with defence mechanisms.
+
+Simplified for convergence:
+- Synchronous exchange (no async races)
+- Cleaner beta semantics: beta = weight on LOCAL model
+- No FP16 quantization by default (stability)
+- No layer filtering by default (exchange all)
+"""
 from __future__ import annotations
 
 import logging
@@ -14,18 +22,19 @@ from .sac import SACAgent
 
 _log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
 
 def quantize_state_fp16(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Quantize actor weights to FP16 for transmission."""
     return {k: v.half() for k, v in state.items()}
 
 
 def dequantize_state_fp16(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Dequantize received FP16 weights back to FP32."""
     return {k: v.float() for k, v in state.items()}
 
 
@@ -34,19 +43,73 @@ def selective_layer_filter(
     incoming: dict[str, torch.Tensor],
     threshold: float = 0.001,
 ) -> dict[str, torch.Tensor]:
-    """
-    Filter out layers where change is negligible.
-    Returns a filtered incoming state_dict with only changed layers.
-    """
     filtered = {}
     for k in local:
         if k not in incoming:
             continue
-        layer_diff_std = float(torch.std(incoming[k] - local[k]).item())
-        if layer_diff_std >= threshold:
+        if float(torch.std(incoming[k] - local[k]).item()) >= threshold:
             filtered[k] = incoming[k]
     return filtered
 
+
+def cosine_similarity_state_dict(
+    state_a: dict[str, torch.Tensor],
+    state_b: dict[str, torch.Tensor],
+) -> float:
+    a_vec = torch.cat([state_a[k].float().reshape(-1) for k in state_a])
+    b_vec = torch.cat([state_b[k].float().reshape(-1) for k in state_b])
+    denom = torch.linalg.norm(a_vec) * torch.linalg.norm(b_vec)
+    if denom == 0.0:
+        return 0.0
+    return float((torch.dot(a_vec, b_vec) / denom).item())
+
+
+def state_dict_to_vector(state: dict[str, torch.Tensor]) -> torch.Tensor:
+    return torch.cat([v.reshape(-1).float() for v in state.values()], dim=0)
+
+
+def aggregate_state_dicts_trimmed_mean(
+    states: list[dict[str, torch.Tensor]],
+    trim_ratio: float,
+) -> dict[str, torch.Tensor]:
+    if not states:
+        raise ValueError("states cannot be empty")
+    if len(states) == 1:
+        return states[0]
+    trim_ratio = float(max(0.0, min(0.49, trim_ratio)))
+    trim_k = int(len(states) * trim_ratio)
+    out: dict[str, torch.Tensor] = {}
+    for k in states[0]:
+        stacked = torch.stack([s[k] for s in states], dim=0)
+        if trim_k > 0 and (len(states) - 2 * trim_k) > 0:
+            sorted_vals, _ = torch.sort(stacked, dim=0)
+            out[k] = sorted_vals[trim_k:len(states) - trim_k].mean(dim=0)
+        else:
+            out[k] = stacked.mean(dim=0)
+    return out
+
+
+def krum_select_index(vectors: list[torch.Tensor], malicious_count: int) -> int:
+    n = len(vectors)
+    if n == 0:
+        raise ValueError("vectors cannot be empty")
+    if n == 1:
+        return 0
+    if n == 2:
+        return 1 if malicious_count == 0 else 0
+    f = max(0, malicious_count)
+    neighbor_count = max(1, n - f - 2)
+    stacked = torch.stack(vectors)
+    distances = torch.cdist(stacked.unsqueeze(0), stacked.unsqueeze(0)).squeeze(0)
+    distances.fill_diagonal_(float("inf"))
+    k = min(neighbor_count, n - 1)
+    nearest_dists, _ = torch.topk(distances, k, dim=1, largest=False)
+    return int(torch.argmin(nearest_dists.sum(dim=1)).item())
+
+
+# ---------------------------------------------------------------------------
+# Stats / dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DefenseStats:
@@ -77,98 +140,26 @@ class RunningStat:
 
     def update(self, x: float) -> None:
         self.n += 1
-        delta = x - self.mean
-        self.mean += delta / self.n
-        delta2 = x - self.mean
-        self.m2 += delta * delta2
+        d1 = x - self.mean
+        self.mean += d1 / self.n
+        d2 = x - self.mean
+        self.m2 += d1 * d2
 
     @property
     def std(self) -> float:
-        if self.n < 2:
-            return 0.0
-        return float((self.m2 / (self.n - 1)) ** 0.5)
+        return float((self.m2 / (self.n - 1)) ** 0.5) if self.n >= 2 else 0.0
 
 
-def cosine_similarity_state_dict(
-    state_a: dict[str, torch.Tensor],
-    state_b: dict[str, torch.Tensor],
-) -> float:
-    # Vectorised: concatenate all params into single vectors to avoid per-layer .item() overhead
-    a_vec = torch.cat([state_a[k].float().reshape(-1) for k in state_a])
-    b_vec = torch.cat([state_b[k].float().reshape(-1) for k in state_b])
-    denom = torch.linalg.norm(a_vec) * torch.linalg.norm(b_vec)
-    if denom == 0.0:
-        return 0.0
-    return float(torch.dot(a_vec, b_vec).item() / denom.item())
-
-
-def state_dict_to_vector(state: dict[str, torch.Tensor]) -> torch.Tensor:
-    return torch.cat([v.reshape(-1).float() for v in state.values()], dim=0)
-
-
-def aggregate_state_dicts_trimmed_mean(
-    states: list[dict[str, torch.Tensor]],
-    trim_ratio: float,
-) -> dict[str, torch.Tensor]:
-    if len(states) == 0:
-        raise ValueError("states cannot be empty")
-    if len(states) == 1:
-        return states[0]
-
-    trim_ratio = float(max(0.0, min(0.49, trim_ratio)))
-    trim_k = int(len(states) * trim_ratio)
-    out: dict[str, torch.Tensor] = {}
-    for k in states[0]:
-        stacked = torch.stack([s[k] for s in states], dim=0)
-        if trim_k > 0 and (len(states) - 2 * trim_k) > 0:
-            sorted_vals, _ = torch.sort(stacked, dim=0)
-            trimmed = sorted_vals[trim_k : len(states) - trim_k]
-            out[k] = trimmed.mean(dim=0)
-        else:
-            out[k] = stacked.mean(dim=0)
-    return out
-
-
-def krum_select_index(vectors: list[torch.Tensor], malicious_count: int) -> int:
-    n = len(vectors)
-    if n == 0:
-        raise ValueError("vectors cannot be empty")
-    if n == 1:
-        return 0
-    if n == 2:
-        # If there's only local model and 1 neighbor, and no malicious nodes expected,
-        # we can blindly trust the neighbor to allow learning. Otherwise, trust local.
-        return 1 if malicious_count == 0 else 0
-    
-    f = max(0, malicious_count)
-    # Ensure we select at least 1 neighbor distance
-    neighbor_count = max(1, n - f - 2)
-    
-    # If f is too large relative to n, Krum is theoretically impossible.
-    # E.g. n=3, f=1 => n - f - 2 = 0.
-    # We force neighbor_count to be at least 1 to avoid crash, but defense is weak.
-    if neighbor_count < 1:
-        neighbor_count = 1
-
-    stacked = torch.stack(vectors)  # (n, d)
-    distances = torch.cdist(stacked.unsqueeze(0), stacked.unsqueeze(0)).squeeze(0)
-    # Mask diagonal (self-distance = 0) with inf so it's excluded from topk
-    distances.fill_diagonal_(float("inf"))
-    # Use topk to find nearest neighbors (faster than full sort)
-    k = min(neighbor_count, n - 1)
-    nearest_dists, _ = torch.topk(distances, k, dim=1, largest=False)
-    scores = nearest_dists.sum(dim=1)
-    return int(torch.argmin(scores).item())
-
+# ---------------------------------------------------------------------------
+# P2P Aggregator
+# ---------------------------------------------------------------------------
 
 class P2PAggregator:
-    """
-    Event-triggered actor-only aggregation with optional robust defenses.
-    """
+    """Synchronous actor-only aggregation with optional robust defences."""
 
     def __init__(self, cfg: P2PConfig) -> None:
         self.cfg = cfg
-        self._last_exchange: dict[tuple[int, int], int] = defaultdict(lambda: -10**9)
+        self._last_exchange: dict[tuple[int, int], int] = defaultdict(lambda: -(10**9))
         self.bytes_transferred = 0
         self.defense_stats = DefenseStats()
         self._sim_stat = RunningStat()
@@ -200,263 +191,168 @@ class P2PAggregator:
         malicious_nodes = malicious_nodes or set()
         ids = sorted(agents.keys())
 
-        _t_extract = time.monotonic()
+        # 1. Extract states
+        _t0 = time.monotonic()
         current_states = {rid: agents[rid].get_actor_state(cpu_clone=True) for rid in ids}
-        _t_quant = time.monotonic()
-
-        # FP16 quantization for communication
         if self.cfg.use_fp16_comm:
             current_states = {rid: quantize_state_fp16(s) for rid, s in current_states.items()}
+        sample_bytes = sum(v.numel() * v.element_size() for v in current_states[ids[0]].values())
 
-        # Compute payload bytes once (shared across all pairs for same model size)
-        _sample_bytes = self._estimate_payload_bytes(current_states[ids[0]])
-        payload_bytes_cache = {rid: _sample_bytes for rid in ids}
-        _t_prep_done = time.monotonic()
-        _log.debug(
-            "exchange step=%d: extract=%.3fs quant=%.3fs",
-            step_idx, _t_quant - _t_extract, _t_prep_done - _t_quant,
-        )
-
+        # 2. Pair exchange
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0
-        local_bytes_transferred = 0
+        local_bytes = 0
         exchanged_pairs: list[tuple[int, int]] = []
-
-        _t0 = time.monotonic()
         use_layer_filter = self.cfg.layer_diff_threshold > 0
         malicious_active = bool(malicious_nodes) and step_idx >= attack_start_step
 
         for a, b in self._candidate_pairs(ids, positions):
             if not self._can_exchange(step_idx, a, b, positions):
                 continue
-            payload_bytes = payload_bytes_cache[a]
-            local_bytes_transferred += payload_bytes * 2
+            local_bytes += sample_bytes * 2
 
-            # Only apply attack processing if there are active malicious nodes
             if malicious_active:
-                incoming_to_a = self._apply_attack(
-                    step_idx=step_idx, sender_id=b,
-                    original_state=current_states[b],
-                    malicious_nodes=malicious_nodes,
-                    attack_type=attack_type,
-                    attack_start_step=attack_start_step,
-                )
-                incoming_to_b = self._apply_attack(
-                    step_idx=step_idx, sender_id=a,
-                    original_state=current_states[a],
-                    malicious_nodes=malicious_nodes,
-                    attack_type=attack_type,
-                    attack_start_step=attack_start_step,
-                )
+                inc_a = self._apply_attack(step_idx=step_idx, sender_id=b, original_state=current_states[b],
+                                           malicious_nodes=malicious_nodes, attack_type=attack_type, attack_start_step=attack_start_step)
+                inc_b = self._apply_attack(step_idx=step_idx, sender_id=a, original_state=current_states[a],
+                                           malicious_nodes=malicious_nodes, attack_type=attack_type, attack_start_step=attack_start_step)
             else:
-                incoming_to_a = current_states[b]
-                incoming_to_b = current_states[a]
+                inc_a, inc_b = current_states[b], current_states[a]
 
-            # Selective layer filtering if enabled
             if use_layer_filter:
-                local_a = current_states[a]
-                local_b = current_states[b]
-                filtered_a = selective_layer_filter(local_a, incoming_to_a, self.cfg.layer_diff_threshold)
-                filtered_b = selective_layer_filter(local_b, incoming_to_b, self.cfg.layer_diff_threshold)
-                incoming_to_a = {**local_a, **filtered_a}
-                incoming_to_b = {**local_b, **filtered_b}
+                fa = selective_layer_filter(current_states[a], inc_a, self.cfg.layer_diff_threshold)
+                fb = selective_layer_filter(current_states[b], inc_b, self.cfg.layer_diff_threshold)
+                inc_a = {**current_states[a], **fa}
+                inc_b = {**current_states[b], **fb}
 
             dist_ab = euclidean_distance(positions[a], positions[b])
-
-            incoming[a].append(
-                IncomingCandidate(
-                    sender_id=b, state=incoming_to_a,
-                    sender_is_malicious=(malicious_active and b in malicious_nodes),
-                    distance=dist_ab,
-                )
-            )
-            incoming[b].append(
-                IncomingCandidate(
-                    sender_id=a, state=incoming_to_b,
-                    sender_is_malicious=(malicious_active and a in malicious_nodes),
-                    distance=dist_ab,
-                )
-            )
+            incoming[a].append(IncomingCandidate(b, inc_a, malicious_active and b in malicious_nodes, dist_ab))
+            incoming[b].append(IncomingCandidate(a, inc_b, malicious_active and a in malicious_nodes, dist_ab))
             exchanged_pairs.append((a, b))
             exchanges += 1
 
-        # Batch lock acquisition instead of per-pair
-        _t1 = time.monotonic()
+        # 3. Record exchange history
         with self._lock:
             for a, b in exchanged_pairs:
                 self._last_exchange[(a, b)] = step_idx
-            self.bytes_transferred += local_bytes_transferred
+            self.bytes_transferred += local_bytes
 
-        _t2 = time.monotonic()
-        merged_states = {}
+        # 4. Merge
+        merged_states: dict[int, dict[str, torch.Tensor]] = {}
         for rid in ids:
             if rid not in incoming:
                 continue
             merged = self._merge_incoming(
-                local_state=current_states[rid],
-                candidates=incoming[rid],
-                progress=progress,
-                defense_enabled=defense_enabled,
-                defense_strategy=defense_strategy,
-                defense_trim_ratio=defense_trim_ratio,
-                defense_krum_malicious=defense_krum_malicious,
-                calibration_steps=calibration_steps,
-                in_calibration=(step_idx < calibration_steps),
+                local_state=current_states[rid], candidates=incoming[rid], progress=progress,
+                defense_enabled=defense_enabled, defense_strategy=defense_strategy,
+                defense_trim_ratio=defense_trim_ratio, defense_krum_malicious=defense_krum_malicious,
+                calibration_steps=calibration_steps, in_calibration=(step_idx < calibration_steps),
             )
-            # Dequantize if using FP16 comm
             if self.cfg.use_fp16_comm:
                 merged = dequantize_state_fp16(merged)
             merged_states[rid] = merged
 
-        _t3 = time.monotonic()
+        _t1 = time.monotonic()
         _log.debug(
-            "exchange step=%d: pairs=%.3fs lock=%.3fs merge=%.3fs total=%.3fs exch=%d",
-            step_idx, _t1 - _t0, _t2 - _t1, _t3 - _t2, _t3 - _t0, exchanges,
+            "exchange step=%d: total=%.3fs n_exch=%d n_merged=%d",
+            step_idx, _t1 - _t0, exchanges, len(merged_states),
         )
         return exchanges, merged_states
 
-    def _candidate_pairs(
-        self,
-        ids: list[int],
-        positions: dict[int, np.ndarray],
-    ) -> list[tuple[int, int]]:
+    # -- Internals -------------------------------------------------------
+
+    def _candidate_pairs(self, ids: list[int], positions: dict[int, np.ndarray]) -> list[tuple[int, int]]:
         if not self.cfg.use_grid_index:
             return [(ids[i], ids[j]) for i in range(len(ids)) for j in range(i + 1, len(ids))]
         cell = max(1e-6, float(self.cfg.grid_cell_size))
         buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
         for rid in ids:
             px, py = float(positions[rid][0]), float(positions[rid][1])
-            key = (int(np.floor(px / cell)), int(np.floor(py / cell)))
-            buckets[key].append(rid)
+            buckets[(int(np.floor(px / cell)), int(np.floor(py / cell)))].append(rid)
         neigh = (-1, 0, 1)
         pair_set: set[tuple[int, int]] = set()
         for (cx, cy), members in buckets.items():
-            local_cells = [(cx + dx, cy + dy) for dx in neigh for dy in neigh]
+            ncs = [(cx + dx, cy + dy) for dx in neigh for dy in neigh]
             for rid in members:
-                for nc in local_cells:
+                for nc in ncs:
                     for other in buckets.get(nc, []):
-                        if rid >= other:
-                            continue
-                        pair_set.add((rid, other))
+                        if rid < other:
+                            pair_set.add((rid, other))
         return sorted(pair_set)
 
-    def _estimate_payload_bytes(self, state: dict[str, torch.Tensor]) -> int:
-        # Fast path: just sum up the raw bytes without expensive std() calls.
-        # The std-based filtering was a minor optimization for logging accuracy
-        # but cost more than it saved due to per-layer torch.std() computation.
-        return sum(v.numel() * v.element_size() for v in state.values())
-
-    def _can_exchange(
-        self,
-        step_idx: int,
-        a: int,
-        b: int,
-        positions: dict[int, np.ndarray],
-    ) -> bool:
+    def _can_exchange(self, step_idx: int, a: int, b: int, positions: dict[int, np.ndarray]) -> bool:
         if euclidean_distance(positions[a], positions[b]) >= self.cfg.comm_radius:
             return False
-        last = self._last_exchange[(a, b)]
-        return (step_idx - last) >= self.cfg.cooldown_steps
+        return (step_idx - self._last_exchange[(a, b)]) >= self.cfg.cooldown_steps
 
     def _merge_incoming(
-        self,
-        *,
-        local_state: dict[str, torch.Tensor],
-        candidates: list[IncomingCandidate],
-        progress: float,
-        defense_enabled: bool,
-        defense_strategy: str,
-        defense_trim_ratio: float,
-        defense_krum_malicious: int,
-        calibration_steps: int,
-        in_calibration: bool,
+        self, *, local_state: dict[str, torch.Tensor], candidates: list[IncomingCandidate],
+        progress: float, defense_enabled: bool, defense_strategy: str,
+        defense_trim_ratio: float, defense_krum_malicious: int,
+        calibration_steps: int, in_calibration: bool,
     ) -> dict[str, torch.Tensor]:
-        if len(candidates) == 0:
+        if not candidates:
             return local_state
 
         if not defense_enabled:
-            # Average distance of all candidates for dynamic beta
-            avg_dist = float(np.mean([c.distance for c in candidates]))
-            incoming_mean = aggregate_state_dicts_trimmed_mean(
-                [c.state for c in candidates], trim_ratio=0.0
-            )
-            self._update_accept_reject_stats(candidates, set(range(len(candidates))))
-            return self._blend(local_state, incoming_mean, distance=avg_dist, progress=progress)
+            inc_mean = aggregate_state_dicts_trimmed_mean([c.state for c in candidates], 0.0)
+            self._update_stats(candidates, set(range(len(candidates))))
+            return self._blend(local_state, inc_mean, progress)
 
         if defense_strategy == "cosine":
-            accepted: list[IncomingCandidate] = []
-            threshold = self._threshold(calibration_steps=calibration_steps)
-            self.last_similarity_threshold = threshold
-            for c in candidates:
-                similarity = cosine_similarity_state_dict(local_state, c.state)
-                if in_calibration and (not c.sender_is_malicious):
-                    self._sim_stat.update(similarity)
-                should_reject = (
-                    (not in_calibration)
-                    and threshold > -1.0
-                    and similarity < threshold
-                )
-                if should_reject:
-                    self.defense_stats.rejected_updates += 1
-                    if c.sender_is_malicious:
-                        self.defense_stats.rejected_malicious_updates += 1
-                    self.defense_stats.potential_malicious_nodes.add(c.sender_id)
-                    self.rejected_by_sender[c.sender_id] += 1
-                    continue
+            return self._merge_cosine(local_state, candidates, progress, calibration_steps, in_calibration)
+        if defense_strategy == "trimmed_mean":
+            inc_mean = aggregate_state_dicts_trimmed_mean([c.state for c in candidates], defense_trim_ratio)
+            self._update_stats(candidates, set(range(len(candidates))))
+            return self._blend(local_state, inc_mean, progress)
+        # krum
+        return self._merge_krum(local_state, candidates, progress, defense_krum_malicious)
+
+    def _merge_cosine(
+        self, local_state: dict[str, torch.Tensor], candidates: list[IncomingCandidate],
+        progress: float, calibration_steps: int, in_calibration: bool,
+    ) -> dict[str, torch.Tensor]:
+        threshold = self._threshold(calibration_steps)
+        self.last_similarity_threshold = threshold
+        accepted: list[IncomingCandidate] = []
+        for c in candidates:
+            sim = cosine_similarity_state_dict(local_state, c.state)
+            if in_calibration and not c.sender_is_malicious:
+                self._sim_stat.update(sim)
+            should_reject = (not in_calibration) and threshold > -1.0 and sim < threshold
+            if should_reject:
+                self.defense_stats.rejected_updates += 1
+                if c.sender_is_malicious:
+                    self.defense_stats.rejected_malicious_updates += 1
+                self.defense_stats.potential_malicious_nodes.add(c.sender_id)
+                self.rejected_by_sender[c.sender_id] += 1
+            else:
                 accepted.append(c)
                 self.defense_stats.accepted_updates += 1
                 if c.sender_is_malicious:
                     self.defense_stats.accepted_malicious_updates += 1
-            if len(accepted) == 0:
-                return local_state
-            
-            avg_dist = float(np.mean([c.distance for c in accepted]))
-            incoming_mean = aggregate_state_dicts_trimmed_mean(
-                [c.state for c in accepted], trim_ratio=0.0
-            )
-            return self._blend(local_state, incoming_mean, distance=avg_dist, progress=progress)
-
-        if defense_strategy == "trimmed_mean":
-            avg_dist = float(np.mean([c.distance for c in candidates]))
-            incoming_states = [c.state for c in candidates]
-            incoming_mean = aggregate_state_dicts_trimmed_mean(
-                incoming_states, trim_ratio=defense_trim_ratio
-            )
-            # Trimmed-mean is element-wise; a sender may be partly used and partly trimmed.
-            # Record all senders as accepted at sender-level to avoid misleading "fully rejected" stats.
-            self._update_accept_reject_stats(candidates, set(range(len(candidates))))
-            return self._blend(local_state, incoming_mean, distance=avg_dist, progress=progress)
-
-        # Krum: include local model as a candidate anchor for robust selection.
-        krum_pool = [local_state] + [c.state for c in candidates]
-        vectors = []
-        for s in krum_pool:
-            v = state_dict_to_vector(s)
-            vectors.append(v)
-            
-        # Select the index of the "best" model in the pool (0 is local, 1..k are candidates)
-        sel_idx = krum_select_index(vectors, malicious_count=defense_krum_malicious)
-        
-        # If sel_idx is 0, it means Krum chose our OWN local model as the best center.
-        # This implies all external candidates were considered "worse" or "outliers".
-        # So we reject all candidates and keep local state.
-        if sel_idx == 0:
-            self._update_accept_reject_stats(candidates, used_indices=set())
+        if not accepted:
             return local_state
-            
-        # If sel_idx > 0, Krum chose candidate[sel_idx - 1]
-        chosen_candidate_idx = sel_idx - 1
-        used = {chosen_candidate_idx}
-        self._update_accept_reject_stats(candidates, used)
-        
-        # Blend with the chosen candidate
-        incoming_state = candidates[chosen_candidate_idx].state
-        dist = candidates[chosen_candidate_idx].distance
-        return self._blend(local_state, incoming_state, distance=dist, progress=progress)
+        inc_mean = aggregate_state_dicts_trimmed_mean([c.state for c in accepted], 0.0)
+        return self._blend(local_state, inc_mean, progress)
 
-    def _update_accept_reject_stats(self, candidates: list[IncomingCandidate], used_indices: set[int]) -> None:
+    def _merge_krum(
+        self, local_state: dict[str, torch.Tensor], candidates: list[IncomingCandidate],
+        progress: float, krum_malicious: int,
+    ) -> dict[str, torch.Tensor]:
+        pool = [local_state] + [c.state for c in candidates]
+        vectors = [state_dict_to_vector(s) for s in pool]
+        sel = krum_select_index(vectors, krum_malicious)
+        if sel == 0:
+            self._update_stats(candidates, set())
+            return local_state
+        ci = sel - 1
+        self._update_stats(candidates, {ci})
+        return self._blend(local_state, candidates[ci].state, progress)
+
+    def _update_stats(self, candidates: list[IncomingCandidate], used: set[int]) -> None:
         for idx, c in enumerate(candidates):
-            if idx in used_indices:
+            if idx in used:
                 self.defense_stats.accepted_updates += 1
                 if c.sender_is_malicious:
                     self.defense_stats.accepted_malicious_updates += 1
@@ -473,63 +369,45 @@ class P2PAggregator:
         return self._sim_stat.mean - 3.0 * self._sim_stat.std
 
     def _blend(
-        self,
-        local_state: dict[str, torch.Tensor],
-        incoming_state: dict[str, torch.Tensor],
-        distance: float | None = None,
+        self, local_state: dict[str, torch.Tensor], incoming_state: dict[str, torch.Tensor],
         progress: float = 0.0,
     ) -> dict[str, torch.Tensor]:
-        # 1. Base beta from schedule or default
+        """Blend local and incoming states.
+
+        beta = weight on LOCAL model.
+        beta=0.5 means equal blend. beta=0.7 means 70% local, 30% incoming.
+        """
         beta = self.cfg.beta
         if self.cfg.beta_schedule == "linear":
-            beta = self.cfg.beta_max - (self.cfg.beta_max - self.cfg.beta_min) * progress
-        elif self.cfg.beta_schedule == "exponential":
-            if self.cfg.beta_max > 0:
-                beta = self.cfg.beta_max * ((self.cfg.beta_min / self.cfg.beta_max) ** progress)
-        
-        # 2. Refine beta based on distance if enabled
-        # If dynamic_beta is ON, distance-based logic scales the baseline beta
-        if self.cfg.dynamic_beta and distance is not None:
-            normalized_dist = min(distance / self.cfg.comm_radius, 1.0)
-            # Use current scheduled beta as the 'local trust' baseline for nearby robots
-            # and scale down to beta_min for far-away robots.
-            b_high = max(beta, self.cfg.beta_max)
-            b_low = self.cfg.beta_min
-            beta = b_high - (b_high - b_low) * normalized_dist
-        
-        inv_beta = 1.0 - beta
-        out: dict[str, torch.Tensor] = {}
-        for k in local_state:
-            out[k] = torch.lerp(incoming_state[k], local_state[k], beta)
-        return out
+            # Start trusting peers more, then reduce over time
+            beta = self.cfg.beta_min + (self.cfg.beta_max - self.cfg.beta_min) * progress
+        elif self.cfg.beta_schedule == "exponential" and self.cfg.beta_max > 0:
+            beta = self.cfg.beta_min * ((self.cfg.beta_max / self.cfg.beta_min) ** progress)
+
+        # torch.lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
+        # We want: result = beta * local + (1-beta) * incoming
+        # = torch.lerp(incoming, local, beta)
+        return {k: torch.lerp(incoming_state[k], local_state[k], beta) for k in local_state}
 
     def _apply_attack(
-        self,
-        *,
-        step_idx: int,
-        sender_id: int,
-        original_state: dict[str, torch.Tensor],
-        malicious_nodes: set[int],
-        attack_type: str,
-        attack_start_step: int,
+        self, *, step_idx: int, sender_id: int, original_state: dict[str, torch.Tensor],
+        malicious_nodes: set[int], attack_type: str, attack_start_step: int,
     ) -> dict[str, torch.Tensor]:
         if sender_id not in malicious_nodes or step_idx < attack_start_step:
             return original_state
-        if attack_type not in {"zero", "gaussian"}:
-            raise ValueError(f"Unsupported attack_type: {attack_type}")
-        attacked: dict[str, torch.Tensor] = {}
-        for k, v in original_state.items():
-            if attack_type == "zero":
-                attacked[k] = torch.zeros_like(v)
-            else:
-                attacked[k] = torch.randn_like(v)
-        return attacked
+        if attack_type == "zero":
+            return {k: torch.zeros_like(v) for k, v in original_state.items()}
+        if attack_type == "gaussian":
+            return {k: torch.randn_like(v) for k, v in original_state.items()}
+        raise ValueError(f"Unsupported attack_type: {attack_type}")
 
+
+# ---------------------------------------------------------------------------
+# Centralised baseline
+# ---------------------------------------------------------------------------
 
 class CentralizedFedAvg:
-    """
-    Baseline aggregator that averages all actor weights at fixed intervals.
-    """
+    """Baseline: average all actor weights at fixed intervals."""
 
     def __init__(self, interval_steps: int, beta: float) -> None:
         self.interval_steps = interval_steps
@@ -538,36 +416,15 @@ class CentralizedFedAvg:
         self._lock = threading.Lock()
 
     def maybe_aggregate(self, step_idx: int, agents: dict[int, SACAgent]) -> tuple[int, dict[int, dict[str, torch.Tensor]]]:
-        if step_idx % self.interval_steps != 0:
+        if step_idx % self.interval_steps != 0 or not agents:
             return 0, {}
-        if not agents:
-            return 0, {}
-
         ids = sorted(agents.keys())
         states = {rid: agents[rid].get_actor_state(cpu_clone=True) for rid in ids}
         merged: dict[str, torch.Tensor] = {}
-
         for k in states[ids[0]]:
-            stacked = torch.stack([states[rid][k] for rid in ids], dim=0)
-            merged[k] = stacked.mean(dim=0)
-
-        payload_one_way = sum(v.numel() * v.element_size() for v in merged.values())
-
+            merged[k] = torch.stack([states[rid][k] for rid in ids], dim=0).mean(dim=0)
+        payload = sum(v.numel() * v.element_size() for v in merged.values())
         with self._lock:
-            self.bytes_transferred += payload_one_way * (len(ids) * 2)
-
-        merged_states = {}
-        for rid in ids:
-            blended = self._blend(states[rid], merged)  # Reuse already-extracted states
-            merged_states[rid] = blended
-        return 1, merged_states
-
-    def _blend(
-        self,
-        local_state: dict[str, torch.Tensor],
-        incoming_state: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        for k in local_state:
-            out[k] = self.beta * local_state[k] + (1.0 - self.beta) * incoming_state[k]
-        return out
+            self.bytes_transferred += payload * len(ids) * 2
+        # beta = weight on local, (1-beta) = weight on global average
+        return 1, {rid: {k: torch.lerp(merged[k], states[rid][k], self.beta) for k in merged} for rid in ids}

@@ -28,48 +28,49 @@ class SACConfig:
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
-    batch_size: int = 512
+    batch_size: int = 256
     buffer_size: int = 100_000
-    hidden_size: int = 512
-    hidden_layers: int = 3
-    residual: bool = True
-    actor_encoder: str = "attention"  # attention | cnn | mlp
-    actor_use_cnn: bool = True  # deprecated compatibility flag
-    attention_dim: int = 128
-    attention_heads: int = 4
-    attention_layers: int = 3
-    warmup_steps: int = 1_000
-    update_after: int = 1_000
-    update_every: int = 2
-    gradient_updates: int = 2
+    hidden_size: int = 256
+    hidden_layers: int = 2
+    residual: bool = False
+    actor_encoder: str = "mlp"
+    actor_use_cnn: bool = False
+    attention_dim: int = 64
+    attention_heads: int = 2
+    attention_layers: int = 1
+    warmup_steps: int = 500
+    update_after: int = 256
+    update_every: int = 1         # Train every step (no cadence gate)
+    gradient_updates: int = 1     # 1 gradient update per train call
     log_std_min: float = -20.0
     log_std_max: float = 2.0
-    grad_clip_norm: float = 5.0
+    grad_clip_norm: float = 1.0
     use_amp: bool = True
-    amp_dtype: str = "bf16"  # bf16 | fp16
+    amp_dtype: str = "bf16"
     enable_tf32: bool = True
     enable_torch_compile: bool = False
     compile_mode: str = "reduce-overhead"
     use_gpu_replay: bool = True
-    actor_update_interval: int = 2
+    actor_update_interval: int = 1  # Update actor every critic update
+    shared_replay: bool = True      # Share replay buffer across agents
 
 
 @dataclass(frozen=True)
 class P2PConfig:
-    comm_radius: float = 2.0
-    cooldown_steps: int = 50
-    beta: float = 0.7
-    exchange_interval_steps: int = 50
-    weight_std_threshold: float = 0.01
+    comm_radius: float = 3.0
+    cooldown_steps: int = 100
+    beta: float = 0.5               # Balanced blend: 50% local, 50% incoming
+    exchange_interval_steps: int = 100
+    weight_std_threshold: float = 0.0
     use_grid_index: bool = True
-    grid_cell_size: float = 2.5
-    use_fp16_comm: bool = True
-    layer_diff_threshold: float = 0.001
-    async_exchange: bool = True
-    dynamic_beta: bool = True
+    grid_cell_size: float = 3.5
+    use_fp16_comm: bool = False      # Disabled for stability
+    layer_diff_threshold: float = 0.0  # Exchange all layers
+    async_exchange: bool = False     # Synchronous to avoid race conditions
+    dynamic_beta: bool = False       # Fixed beta for predictability
     beta_min: float = 0.3
-    beta_max: float = 0.9
-    beta_schedule: str = "constant"  # constant | linear | exponential
+    beta_max: float = 0.7
+    beta_schedule: str = "constant"
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,7 @@ def build_config(
     beta_schedule: str | None = None,
     sac_gradient_updates: int | None = None,
     sac_batch_size: int | None = None,
+    shared_replay: bool | None = None,
 ) -> ExperimentConfig:
     base = ExperimentConfig()
     frame_stack_val = max(1, int(frame_stack if frame_stack is not None else base.frame_stack))
@@ -155,6 +157,7 @@ def build_config(
         actor_update_interval=(
             actor_update_interval if actor_update_interval is not None else base.sac.actor_update_interval
         ),
+        shared_replay=base.sac.shared_replay if shared_replay is None else bool(shared_replay),
     )
     p2p_cfg = P2PConfig(
         comm_radius=comm_radius if comm_radius is not None else base.p2p.comm_radius,
@@ -181,13 +184,9 @@ def build_config(
         async_exchange=base.p2p.async_exchange if async_exchange is None else bool(async_exchange),
         beta_schedule=beta_schedule if beta_schedule is not None else base.p2p.beta_schedule,
     )
-    
-    # Priority logic:
-    # 1. If max_timesteps is explicitly provided, it defines the total budget.
-    # 2. Otherwise, use max_epochs * steps_per_epoch.
-    
+
     final_steps_per_epoch = steps_per_epoch if steps_per_epoch is not None else base.steps_per_epoch
-    
+
     if max_timesteps is not None:
         calc_timesteps = max_timesteps
         final_max_epochs = max(1, math.ceil(calc_timesteps / final_steps_per_epoch))

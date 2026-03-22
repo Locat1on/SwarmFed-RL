@@ -43,40 +43,41 @@ def main() -> None:
     parser.add_argument("--obstacle-radius", type=float, default=0.3)
     parser.add_argument("--beta-schedule", choices=["constant", "linear", "exponential"], default="constant")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log-csv", type=str, default=None, help="Path to log CSV (default: auto-generated in artifacts/logs/)")
+    parser.add_argument("--log-csv", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--load-checkpoint-dir", type=str, default=None)
-    parser.add_argument("--defense", action="store_true", help="enable anomaly defense for p2p")
+    parser.add_argument("--defense", action="store_true")
     parser.add_argument("--defense-strategy", choices=["cosine", "trimmed_mean", "krum"], default="cosine")
     parser.add_argument("--defense-trim-ratio", type=float, default=0.2)
     parser.add_argument("--defense-krum-malicious", type=int, default=1)
-    parser.add_argument("--malicious-nodes", type=str, default="", help="comma-separated robot IDs")
+    parser.add_argument("--malicious-nodes", type=str, default="")
     parser.add_argument("--attack-type", choices=["zero", "gaussian"], default="zero")
     parser.add_argument("--calibration-steps", type=int, default=500)
     parser.add_argument("--attack-start-step", type=int, default=500)
     parser.add_argument("--tensorboard-log-dir", type=str, default=None)
-    parser.add_argument("--enable-tensorboard", action="store_true", help="Enable TensorBoard logging (disabled by default for speed)")
+    parser.add_argument("--enable-tensorboard", action="store_true")
     parser.add_argument("--config-snapshot", type=str, default=None)
     parser.add_argument("--progress-every", type=int, default=500)
-    parser.add_argument("--shared-agent", action="store_true", help="Use one shared policy for all robots (faster throughput)")
-    parser.add_argument("--env-step-workers", type=int, default=0, help="Parallel env.step workers (applies to both strict and shared modes)")
-    parser.add_argument("--weight-std-threshold", type=float, default=0.01, help="Std threshold for counting/exchanging significant actor weights")
-    parser.add_argument("--comm-radius", type=float, default=None, help="P2P communication radius override")
-    parser.add_argument("--cooldown-steps", type=int, default=None, help="P2P cooldown steps override")
-    parser.add_argument("--exchange-interval-steps", type=int, default=None, help="P2P exchange interval override")
-    parser.add_argument("--frame-stack", type=int, default=1, help="Number of lidar frames to stack into state")
-    parser.add_argument("--gpu-replay-buffer", action="store_true", help="Use GPU resident replay buffer when CUDA is available")
-    parser.add_argument("--disable-grid-index", action="store_true", help="Disable P2P grid-based neighbor candidate indexing")
-    parser.add_argument("--grid-cell-size", type=float, default=2.0, help="Grid cell size for P2P neighbor indexing")
-    parser.add_argument("--actor-update-interval", type=int, default=2, help="Delayed policy update: update actor every N critic updates")
-    parser.add_argument("--sac-gradient-updates", type=int, default=None, help="Number of gradient updates per train step")
-    parser.add_argument("--sac-batch-size", type=int, default=None, help="SAC training batch size")
-    parser.add_argument("--disable-fp16-comm", action="store_true", help="Disable FP16 quantization for P2P communication (default: enabled)")
-    parser.add_argument("--layer-diff-threshold", type=float, default=0.001, help="Selective layer exchange threshold (0 = exchange all layers)")
-    parser.add_argument("--disable-async-exchange", action="store_true", help="Disable asynchronous P2P exchange (default: enabled)")
-    parser.add_argument("--run-name", type=str, default=None, help="Name of the run (default: auto-generated)")
-    parser.add_argument("--artifact-root", type=str, default="artifacts", help="Root directory for artifacts")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging for P2P exchange timing")
+    parser.add_argument("--shared-agent", action="store_true")
+    parser.add_argument("--env-step-workers", type=int, default=0)
+    parser.add_argument("--weight-std-threshold", type=float, default=0.0)
+    parser.add_argument("--comm-radius", type=float, default=None)
+    parser.add_argument("--cooldown-steps", type=int, default=None)
+    parser.add_argument("--exchange-interval-steps", type=int, default=None)
+    parser.add_argument("--frame-stack", type=int, default=1)
+    parser.add_argument("--gpu-replay-buffer", action="store_true")
+    parser.add_argument("--disable-grid-index", action="store_true")
+    parser.add_argument("--grid-cell-size", type=float, default=3.5)
+    parser.add_argument("--actor-update-interval", type=int, default=1)
+    parser.add_argument("--sac-gradient-updates", type=int, default=None)
+    parser.add_argument("--sac-batch-size", type=int, default=None)
+    parser.add_argument("--disable-fp16-comm", action="store_true")
+    parser.add_argument("--layer-diff-threshold", type=float, default=0.0)
+    parser.add_argument("--disable-async-exchange", action="store_true")
+    parser.add_argument("--no-shared-replay", action="store_true", help="Disable shared replay buffer")
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--artifact-root", type=str, default="artifacts")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     if args.debug:
@@ -90,57 +91,45 @@ def main() -> None:
     if args.mode == "p2p" and args.shared_agent:
         print("Warning: Strict P2P experiment requires independent agents. Disabling --shared-agent for p2p.")
         args.shared_agent = False
-    
+
     # --- Artifact Path Logic ---
     root = Path(args.artifact_root)
-    
-    # 1. Determine Run Name
+
     if args.run_name:
         run_name = args.run_name
     else:
-        # If user provided a log_csv, try to derive run_name from it
         if args.log_csv:
             run_name = Path(args.log_csv).stem
         else:
             import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             run_name = f"{args.mode}_{args.robots}_{timestamp}"
-            
-    # 2. Construct Paths (allow overrides)
-    # Structure: artifacts/{logs,plots,checkpoints,tb,configs}/{mode}/{run_name}/...
-    
-    # Log CSV
+
     if args.log_csv:
         log_csv_path = Path(args.log_csv)
     else:
         log_csv_path = root / "logs" / args.mode / f"{run_name}.csv"
-        
-    # Checkpoints
+
     if args.checkpoint_dir:
         checkpoint_dir = args.checkpoint_dir
     else:
         checkpoint_dir = str(root / "checkpoints" / args.mode / run_name)
-        
-    # TensorBoard
+
     if args.enable_tensorboard and args.tensorboard_log_dir:
         tb_dir = args.tensorboard_log_dir
     elif args.enable_tensorboard:
         tb_dir = str(root / "tb" / args.mode / run_name)
     else:
         tb_dir = None
-        
-    # Config Snapshot
+
     if args.config_snapshot:
         config_path = args.config_snapshot
     else:
         config_path = str(root / "configs" / args.mode / f"{run_name}.json")
-        
-    # Plots (derived from log_csv location or standard location)
-    # We prefer the standard location: artifacts/plots/{mode}/{run_name}
+
     plot_dir = root / "plots" / args.mode / run_name
     terminal_log_path = root / "logs" / args.mode / f"{run_name}.log"
 
-    # Ensure parent directories exist where appropriate
     log_csv_path.parent.mkdir(parents=True, exist_ok=True)
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
     if tb_dir is not None:
@@ -163,18 +152,12 @@ def main() -> None:
             print(f"TensorBoard: {tb_dir if tb_dir is not None else 'disabled'}")
             print(f"Config:      {config_path}")
 
-            # If using Krum defense and user didn't specify krum count, try to infer or validate
             if args.defense and args.defense_strategy == "krum":
-                # In small swarms, Krum needs f < (N-2)/2.
-                # With 3 robots, N=3, (3-2)/2 = 0.5 => f=0 is max possible (no defense).
-                # We warn the user if configuration is mathematically impossible for standard Krum.
                 max_f = (args.robots - 3) // 2
                 if args.defense_krum_malicious > max_f and args.robots < 30:
                     print(
                         f"Warning: Krum with f={args.defense_krum_malicious} on N={args.robots} robots is theoretically unstable (N < 2f+3)."
                     )
-                    print(f"  Standard Krum requires N >= {2*args.defense_krum_malicious + 3}.")
-                    print("  Current implementation will fallback to 'best available' but performance may degrade to Local training.")
 
             summary = run_experiment(
                 mode=args.mode,
@@ -216,6 +199,7 @@ def main() -> None:
                 async_exchange=(not args.disable_async_exchange),
                 sac_gradient_updates=args.sac_gradient_updates,
                 sac_batch_size=args.sac_batch_size,
+                shared_replay=(not args.no_shared_replay),
             )
             print(
                 "Experiment finished | "
