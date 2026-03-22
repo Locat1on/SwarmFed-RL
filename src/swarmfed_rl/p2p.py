@@ -14,6 +14,35 @@ def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
 
+def quantize_state_fp16(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Quantize actor weights to FP16 for transmission."""
+    return {k: v.half() for k, v in state.items()}
+
+
+def dequantize_state_fp16(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Dequantize received FP16 weights back to FP32."""
+    return {k: v.float() for k, v in state.items()}
+
+
+def selective_layer_filter(
+    local: dict[str, torch.Tensor],
+    incoming: dict[str, torch.Tensor],
+    threshold: float = 0.001,
+) -> dict[str, torch.Tensor]:
+    """
+    Filter out layers where change is negligible.
+    Returns a filtered incoming state_dict with only changed layers.
+    """
+    filtered = {}
+    for k in local:
+        if k not in incoming:
+            continue
+        layer_diff_std = float(torch.std(incoming[k] - local[k]).item())
+        if layer_diff_std >= threshold:
+            filtered[k] = incoming[k]
+    return filtered
+
+
 @dataclass
 class DefenseStats:
     accepted_updates: int = 0
@@ -167,7 +196,14 @@ class P2PAggregator:
         malicious_nodes = malicious_nodes or set()
         ids = sorted(agents.keys())
         current_states = {rid: agents[rid].get_actor_state(cpu_clone=False) for rid in ids}
-        payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
+        
+        # FP16 quantization for communication
+        if self.cfg.use_fp16_comm:
+            current_states = {rid: quantize_state_fp16(s) for rid, s in current_states.items()}
+            payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
+        else:
+            payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
+        
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0
 
@@ -175,6 +211,7 @@ class P2PAggregator:
                 if not self._can_exchange(step_idx, a, b, positions):
                     continue
                 payload_bytes = payload_bytes_cache[a]
+                # Actual bytes after FP16 is already reflected in payload_bytes_cache
                 self.bytes_transferred += payload_bytes * 2
 
                 incoming_to_a = self._apply_attack(
@@ -193,6 +230,17 @@ class P2PAggregator:
                     attack_type=attack_type,
                     attack_start_step=attack_start_step,
                 )
+                
+                # Selective layer filtering if enabled
+                if self.cfg.layer_diff_threshold > 0:
+                    local_a_fp16 = quantize_state_fp16(agents[a].get_actor_state(cpu_clone=False)) if self.cfg.use_fp16_comm else agents[a].get_actor_state(cpu_clone=False)
+                    local_b_fp16 = quantize_state_fp16(agents[b].get_actor_state(cpu_clone=False)) if self.cfg.use_fp16_comm else agents[b].get_actor_state(cpu_clone=False)
+                    incoming_to_a_filtered = selective_layer_filter(local_a_fp16, incoming_to_a, self.cfg.layer_diff_threshold)
+                    incoming_to_b_filtered = selective_layer_filter(local_b_fp16, incoming_to_b, self.cfg.layer_diff_threshold)
+                    # Update local state with filtered incoming
+                    incoming_to_a = {**local_a_fp16, **incoming_to_a_filtered}
+                    incoming_to_b = {**local_b_fp16, **incoming_to_b_filtered}
+                
                 incoming[a].append(
                     IncomingCandidate(
                         sender_id=b,
@@ -223,6 +271,9 @@ class P2PAggregator:
                 calibration_steps=calibration_steps,
                 in_calibration=(step_idx < calibration_steps),
             )
+            # Dequantize if using FP16 comm
+            if self.cfg.use_fp16_comm:
+                merged = dequantize_state_fp16(merged)
             agents[rid].load_actor_state(merged)
         return exchanges
 

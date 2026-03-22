@@ -62,6 +62,10 @@ def main() -> None:
     parser.add_argument("--gpu-replay-buffer", action="store_true", help="Use GPU resident replay buffer when CUDA is available")
     parser.add_argument("--disable-grid-index", action="store_true", help="Disable P2P grid-based neighbor candidate indexing")
     parser.add_argument("--grid-cell-size", type=float, default=2.0, help="Grid cell size for P2P neighbor indexing")
+    parser.add_argument("--actor-update-interval", type=int, default=2, help="Delayed policy update: update actor every N critic updates")
+    parser.add_argument("--disable-fp16-comm", action="store_true", help="Disable FP16 quantization for P2P communication (default: enabled)")
+    parser.add_argument("--layer-diff-threshold", type=float, default=0.001, help="Selective layer exchange threshold (0 = exchange all layers)")
+    parser.add_argument("--disable-async-exchange", action="store_true", help="Disable asynchronous P2P exchange (default: enabled)")
     parser.add_argument("--run-name", type=str, default=None, help="Name of the run (default: auto-generated)")
     parser.add_argument("--artifact-root", type=str, default="artifacts", help="Root directory for artifacts")
     args = parser.parse_args()
@@ -187,6 +191,10 @@ def main() -> None:
                 use_gpu_replay=args.gpu_replay_buffer,
                 use_grid_index=(not args.disable_grid_index),
                 grid_cell_size=args.grid_cell_size,
+                actor_update_interval=args.actor_update_interval,
+                use_fp16_comm=(not args.disable_fp16_comm),
+                layer_diff_threshold=args.layer_diff_threshold,
+                async_exchange=(not args.disable_async_exchange),
             )
             print(
                 "Experiment finished | "

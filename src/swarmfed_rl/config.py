@@ -50,6 +50,7 @@ class SACConfig:
     enable_torch_compile: bool = False
     compile_mode: str = "reduce-overhead"
     use_gpu_replay: bool = True
+    actor_update_interval: int = 2
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,9 @@ class P2PConfig:
     weight_std_threshold: float = 0.01
     use_grid_index: bool = True
     grid_cell_size: float = 2.0
+    use_fp16_comm: bool = True
+    layer_diff_threshold: float = 0.001
+    async_exchange: bool = True
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,10 @@ def build_config(
     use_gpu_replay: bool | None = None,
     use_grid_index: bool | None = None,
     grid_cell_size: float | None = None,
+    actor_update_interval: int | None = None,
+    use_fp16_comm: bool | None = None,
+    layer_diff_threshold: float | None = None,
+    async_exchange: bool | None = None,
 ) -> ExperimentConfig:
     base = ExperimentConfig()
     frame_stack_val = max(1, int(frame_stack if frame_stack is not None else base.frame_stack))
@@ -128,6 +136,9 @@ def build_config(
         enable_torch_compile=base.sac.enable_torch_compile,
         compile_mode=base.sac.compile_mode,
         use_gpu_replay=base.sac.use_gpu_replay if use_gpu_replay is None else bool(use_gpu_replay),
+        actor_update_interval=(
+            actor_update_interval if actor_update_interval is not None else base.sac.actor_update_interval
+        ),
     )
     p2p_cfg = P2PConfig(
         comm_radius=comm_radius if comm_radius is not None else base.p2p.comm_radius,
@@ -147,6 +158,11 @@ def build_config(
         grid_cell_size=(
             float(base.p2p.grid_cell_size if grid_cell_size is None else grid_cell_size)
         ),
+        use_fp16_comm=base.p2p.use_fp16_comm if use_fp16_comm is None else bool(use_fp16_comm),
+        layer_diff_threshold=(
+            layer_diff_threshold if layer_diff_threshold is not None else base.p2p.layer_diff_threshold
+        ),
+        async_exchange=base.p2p.async_exchange if async_exchange is None else bool(async_exchange),
     )
     return ExperimentConfig(
         state_dim=state_dim_val,

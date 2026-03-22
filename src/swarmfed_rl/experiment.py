@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -67,6 +67,10 @@ def run_experiment(
     use_gpu_replay: bool | None = None,
     use_grid_index: bool | None = None,
     grid_cell_size: float | None = None,
+    actor_update_interval: int | None = None,
+    use_fp16_comm: bool | None = None,
+    layer_diff_threshold: float | None = None,
+    async_exchange: bool | None = None,
 ) -> ExperimentSummary:
     if mode not in {"local", "centralized", "p2p"}:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -83,6 +87,10 @@ def run_experiment(
         use_gpu_replay=use_gpu_replay,
         use_grid_index=use_grid_index,
         grid_cell_size=grid_cell_size,
+        actor_update_interval=actor_update_interval,
+        use_fp16_comm=use_fp16_comm,
+        layer_diff_threshold=layer_diff_threshold,
+        async_exchange=async_exchange,
     )
     set_global_seed(cfg.seed)
     configure_torch_runtime(enable_tf32=cfg.sac.enable_tf32)
@@ -112,6 +120,10 @@ def run_experiment(
                 "use_gpu_replay": use_gpu_replay,
                 "use_grid_index": use_grid_index,
                 "grid_cell_size": grid_cell_size,
+                "actor_update_interval": actor_update_interval,
+                "use_fp16_comm": use_fp16_comm,
+                "layer_diff_threshold": layer_diff_threshold,
+                "async_exchange": async_exchange,
             },
         )
 
@@ -155,6 +167,11 @@ def run_experiment(
     step_executor = None
     if env_step_workers > 1:
         step_executor = ThreadPoolExecutor(max_workers=env_step_workers)
+    
+    exchange_executor: ThreadPoolExecutor | None = None
+    exchange_future: Future[int] | None = None
+    if cfg.p2p.async_exchange and mode in {"p2p", "centralized"}:
+        exchange_executor = ThreadPoolExecutor(max_workers=1)
 
     try:
         for step in range(cfg.max_timesteps):
@@ -218,9 +235,66 @@ def run_experiment(
                 for sa in shadow_agents.values():
                     sa.load_actor_state(shared_state)
                 if mode == "p2p":
-                    exchanges += p2p.maybe_exchange(
+                    if cfg.p2p.async_exchange:
+                        # Wait for previous exchange to complete
+                        if exchange_future is not None and not exchange_future.done():
+                            exchanges += exchange_future.result()
+                        # Submit new exchange asynchronously
+                        exchange_future = exchange_executor.submit(
+                            p2p.maybe_exchange,
+                            step_idx=step,
+                            agents=shadow_agents,
+                            positions=positions,
+                            malicious_nodes=malicious_nodes,
+                            attack_type=attack_type,
+                            defense_enabled=defense_enabled,
+                            defense_strategy=defense_strategy,
+                            defense_trim_ratio=defense_trim_ratio,
+                            defense_krum_malicious=defense_krum_malicious,
+                            calibration_steps=calibration_steps,
+                            attack_start_step=attack_start_step,
+                        )
+                    else:
+                        exchanges += p2p.maybe_exchange(
+                            step_idx=step,
+                            agents=shadow_agents,
+                            positions=positions,
+                            malicious_nodes=malicious_nodes,
+                            attack_type=attack_type,
+                            defense_enabled=defense_enabled,
+                            defense_strategy=defense_strategy,
+                            defense_trim_ratio=defense_trim_ratio,
+                            defense_krum_malicious=defense_krum_malicious,
+                            calibration_steps=calibration_steps,
+                            attack_start_step=attack_start_step,
+                        )
+                    comm_bytes = p2p.bytes_transferred
+                    shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
+                    shared_ref.load_actor_state(shadow_mean)
+                elif mode == "centralized":
+                    if cfg.p2p.async_exchange:
+                        if exchange_future is not None and not exchange_future.done():
+                            exchanges += exchange_future.result()
+                        exchange_future = exchange_executor.submit(
+                            centralized.maybe_aggregate,
+                            step_idx=step,
+                            agents=shadow_agents,
+                        )
+                    else:
+                        exchanges += centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
+                    comm_bytes = centralized.bytes_transferred
+                    shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
+                    shared_ref.load_actor_state(shadow_mean)
+                else:
+                    comm_bytes = 0
+            elif mode == "p2p":
+                if cfg.p2p.async_exchange:
+                    if exchange_future is not None and not exchange_future.done():
+                        exchanges += exchange_future.result()
+                    exchange_future = exchange_executor.submit(
+                        p2p.maybe_exchange,
                         step_idx=step,
-                        agents=shadow_agents,
+                        agents=agents,
                         positions=positions,
                         malicious_nodes=malicious_nodes,
                         attack_type=attack_type,
@@ -231,33 +305,32 @@ def run_experiment(
                         calibration_steps=calibration_steps,
                         attack_start_step=attack_start_step,
                     )
-                    comm_bytes = p2p.bytes_transferred
-                    shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
-                    shared_ref.load_actor_state(shadow_mean)
-                elif mode == "centralized":
-                    exchanges += centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
-                    comm_bytes = centralized.bytes_transferred
-                    shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
-                    shared_ref.load_actor_state(shadow_mean)
                 else:
-                    comm_bytes = 0
-            elif mode == "p2p":
-                exchanges += p2p.maybe_exchange(
-                    step_idx=step,
-                    agents=agents,
-                    positions=positions,
-                    malicious_nodes=malicious_nodes,
-                    attack_type=attack_type,
-                    defense_enabled=defense_enabled,
-                    defense_strategy=defense_strategy,
-                    defense_trim_ratio=defense_trim_ratio,
-                    defense_krum_malicious=defense_krum_malicious,
-                    calibration_steps=calibration_steps,
-                    attack_start_step=attack_start_step,
-                )
+                    exchanges += p2p.maybe_exchange(
+                        step_idx=step,
+                        agents=agents,
+                        positions=positions,
+                        malicious_nodes=malicious_nodes,
+                        attack_type=attack_type,
+                        defense_enabled=defense_enabled,
+                        defense_strategy=defense_strategy,
+                        defense_trim_ratio=defense_trim_ratio,
+                        defense_krum_malicious=defense_krum_malicious,
+                        calibration_steps=calibration_steps,
+                        attack_start_step=attack_start_step,
+                    )
                 comm_bytes = p2p.bytes_transferred
             elif mode == "centralized":
-                exchanges += centralized.maybe_aggregate(step_idx=step, agents=agents)
+                if cfg.p2p.async_exchange:
+                    if exchange_future is not None and not exchange_future.done():
+                        exchanges += exchange_future.result()
+                    exchange_future = exchange_executor.submit(
+                        centralized.maybe_aggregate,
+                        step_idx=step,
+                        agents=agents,
+                    )
+                else:
+                    exchanges += centralized.maybe_aggregate(step_idx=step, agents=agents)
                 comm_bytes = centralized.bytes_transferred
             else:
                 comm_bytes = 0
@@ -309,6 +382,9 @@ def run_experiment(
                         f"exchanges={exchanges} bytes={comm_bytes}",
                         flush=True,
                     )
+        # Finalize any pending async exchanges
+        if exchange_future is not None and not exchange_future.done():
+            exchanges += exchange_future.result()
     finally:
         if csv_file is not None:
             csv_file.close()
@@ -316,6 +392,8 @@ def run_experiment(
             tb_writer.close()
         if step_executor is not None:
             step_executor.shutdown(wait=True)
+        if exchange_executor is not None:
+            exchange_executor.shutdown(wait=True)
 
     if checkpoint_dir:
         if shared_agent:

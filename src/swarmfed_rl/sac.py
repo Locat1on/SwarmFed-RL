@@ -447,24 +447,31 @@ class SACAgent:
         torch.nn.utils.clip_grad_norm_(self.q2.parameters(), self.cfg.sac.grad_clip_norm)
         self.scaler.step(self.q2_opt)
 
-        with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
-            pi, logp = self.actor.sample(state)
-            q_pi = torch.min(self.q1(state, pi), self.q2(state, pi))
-            actor_loss = (self.alpha * logp - q_pi).mean()
-        self._safe_loss(actor_loss, "actor_loss")
-        self.actor_opt.zero_grad()
-        self.scaler.scale(actor_loss).backward()
-        self.scaler.unscale_(self.actor_opt)
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.sac.grad_clip_norm)
-        self.scaler.step(self.actor_opt)
+        # Delayed policy update: only update actor every N critic updates
+        update_actor = (self._train_call_count % self.cfg.sac.actor_update_interval) == 0
+        actor_loss_val = 0.0
+        if update_actor:
+            with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
+                pi, logp = self.actor.sample(state)
+                q_pi = torch.min(self.q1(state, pi), self.q2(state, pi))
+                actor_loss = (self.alpha * logp - q_pi).mean()
+            self._safe_loss(actor_loss, "actor_loss")
+            self.actor_opt.zero_grad()
+            self.scaler.scale(actor_loss).backward()
+            self.scaler.unscale_(self.actor_opt)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.sac.grad_clip_norm)
+            self.scaler.step(self.actor_opt)
+            actor_loss_val = float(actor_loss.item())
 
-        with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
-            alpha_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
-        self._safe_loss(alpha_loss, "alpha_loss")
-        self.alpha_opt.zero_grad()
-        alpha_loss.backward()
-        torch.nn.utils.clip_grad_norm_([self.log_alpha], self.cfg.sac.grad_clip_norm)
-        self.alpha_opt.step()
+            with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
+                pi_for_alpha, logp_for_alpha = self.actor.sample(state)
+                alpha_loss = -(self.log_alpha * (logp_for_alpha + self.target_entropy).detach()).mean()
+            self._safe_loss(alpha_loss, "alpha_loss")
+            self.alpha_opt.zero_grad()
+            alpha_loss.backward()
+            torch.nn.utils.clip_grad_norm_([self.log_alpha], self.cfg.sac.grad_clip_norm)
+            self.alpha_opt.step()
+
         self.scaler.update()
 
         self._soft_update(self.q1, self.q1_target)
@@ -473,7 +480,7 @@ class SACAgent:
         return {
             "q1_loss": float(q1_loss.item()),
             "q2_loss": float(q2_loss.item()),
-            "actor_loss": float(actor_loss.item()),
+            "actor_loss": actor_loss_val,
             "alpha": float(self.alpha.item()),
         }
 
