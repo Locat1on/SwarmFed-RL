@@ -78,6 +78,8 @@ def run_experiment(
     layer_diff_threshold: float | None = None,
     async_exchange: bool | None = None,
     beta_schedule: str | None = None,
+    sac_gradient_updates: int | None = None,
+    sac_batch_size: int | None = None,
 ) -> ExperimentSummary:
     if mode not in {"local", "centralized", "p2p"}:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -103,6 +105,8 @@ def run_experiment(
         layer_diff_threshold=layer_diff_threshold,
         async_exchange=async_exchange,
         beta_schedule=beta_schedule,
+        sac_gradient_updates=sac_gradient_updates,
+        sac_batch_size=sac_batch_size,
     )
     set_global_seed(cfg.seed)
     configure_torch_runtime(enable_tf32=cfg.sac.enable_tf32)
@@ -219,13 +223,8 @@ def run_experiment(
                 step_reward = 0.0
                 actions_by_rid: dict[int, np.ndarray] = {}
                 
-                # Ensure previous async exchange is done before touching agent networks
-                if not shared_agent and exchange_future is not None and not exchange_future.done():
-                    res = exchange_future.result()
-                    exchanges += res
-                    epoch_exchanges += res
-                    exchange_future = None
-                
+                # 1. Action Selection
+                actions_by_rid: dict[int, np.ndarray] = {}
                 if shared_agent:
                     shared = next(iter(agents.values()))
                     rid_list = list(range(num_robots))
@@ -237,7 +236,7 @@ def run_experiment(
                         rid: agents[rid].select_action(states[rid], deterministic=False) for rid in range(num_robots)
                     }
 
-                # Environment stepping
+                # 2. Environment stepping
                 env_step_start = time.time()
                 if step_executor is not None:
                     step_futures = {
@@ -281,18 +280,46 @@ def run_experiment(
                 env_step_end = time.time()
                 total_env_time += (env_step_end - env_step_start)
 
-                # Training and exchange
+                # 3. Synchronize Exchange BEFORE Training
+                # We must ensure any background weights updates are fully merged before 
+                # calculating new gradients to prevent state corruption.
+                exchange_start = time.time()
+                if exchange_future is not None and exchange_future.done():
+                    res = exchange_future.result()
+                    exchanges += res
+                    epoch_exchanges += res
+                    exchange_future = None
+                    
+                    # If using shared agent, we must apply the merged shadow weights NOW
+                    if shared_agent and mode in {"p2p", "centralized"}:
+                        shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
+                        shared_ref = next(iter(agents.values()))
+                        shared_ref.load_actor_state(shadow_mean)
+                        del shadow_mean
+                
+                # If we hit an exchange interval but the previous one isn't done, force wait
+                if step % cfg.p2p.exchange_interval_steps == 0 and exchange_future is not None:
+                    res = exchange_future.result()
+                    exchanges += res
+                    epoch_exchanges += res
+                    exchange_future = None
+                    if shared_agent and mode in {"p2p", "centralized"}:
+                        shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
+                        shared_ref = next(iter(agents.values()))
+                        shared_ref.load_actor_state(shadow_mean)
+                        del shadow_mean
+
+                # 4. Training
                 train_start = time.time()
+                log_metrics_this_step = (step % 100 == 0)
                 if not shared_agent:
-                    # Optimized Staggered Training:
-                    # Instead of training 1 robot N times (high Python overhead),
-                    # we train the scheduled robot once per environment step.
-                    # The intensity is controlled via SACConfig (gradient_updates).
                     rid_to_train = step % num_robots
-                    agents[rid_to_train].train_step()
+                    num_updates = cfg.sac.gradient_updates * num_robots
+                    agents[rid_to_train].train_step(num_updates=num_updates, pull_metrics=log_metrics_this_step)
                 else:
                     shared_ref = next(iter(agents.values()))
-                    shared_ref.train_step()
+                    shared_ref.train_step(num_updates=cfg.sac.gradient_updates, pull_metrics=log_metrics_this_step)
+                    # Prepare shadow agents for upcoming exchange if needed
                     if mode in {"p2p", "centralized"} and step % cfg.p2p.exchange_interval_steps == 0:
                         shared_state = shared_ref.get_actor_state(cpu_clone=False)
                         for sa in shadow_agents.values():
@@ -300,21 +327,72 @@ def run_experiment(
                 train_end = time.time()
                 total_train_time += (train_end - train_start)
                 
-                # P2P exchange
-                exchange_start = time.time()
+                # 5. Initiate new P2P exchange
                 progress = step / cfg.max_timesteps
                 comm_bytes = 0
-                if shared_agent:
-                    if mode == "p2p":
-                        if cfg.p2p.async_exchange:
-                            if exchange_future is not None and not exchange_future.done():
-                                res = exchange_future.result()
+                if step % cfg.p2p.exchange_interval_steps == 0:
+                    if shared_agent:
+                        if mode == "p2p":
+                            if cfg.p2p.async_exchange:
+                                exchange_future = exchange_executor.submit(
+                                    p2p.maybe_exchange,
+                                    step_idx=step,
+                                    agents=shadow_agents,
+                                    positions=positions,
+                                    progress=progress,
+                                    malicious_nodes=malicious_nodes,
+                                    attack_type=attack_type,
+                                    defense_enabled=defense_enabled,
+                                    defense_strategy=defense_strategy,
+                                    defense_trim_ratio=defense_trim_ratio,
+                                    defense_krum_malicious=defense_krum_malicious,
+                                    calibration_steps=calibration_steps,
+                                    attack_start_step=attack_start_step,
+                                )
+                            else:
+                                res = p2p.maybe_exchange(
+                                    step_idx=step,
+                                    agents=shadow_agents,
+                                    positions=positions,
+                                    progress=progress,
+                                    malicious_nodes=malicious_nodes,
+                                    attack_type=attack_type,
+                                    defense_enabled=defense_enabled,
+                                    defense_strategy=defense_strategy,
+                                    defense_trim_ratio=defense_trim_ratio,
+                                    defense_krum_malicious=defense_krum_malicious,
+                                    calibration_steps=calibration_steps,
+                                    attack_start_step=attack_start_step,
+                                )
                                 exchanges += res
                                 epoch_exchanges += res
+                                shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
+                                shared_ref = next(iter(agents.values()))
+                                shared_ref.load_actor_state(shadow_mean)
+                                del shadow_mean
+                            comm_bytes = p2p.bytes_transferred
+                        elif mode == "centralized":
+                            if cfg.p2p.async_exchange:
+                                exchange_future = exchange_executor.submit(
+                                    centralized.maybe_aggregate,
+                                    step_idx=step,
+                                    agents=shadow_agents,
+                                )
+                            else:
+                                res = centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
+                                exchanges += res
+                                epoch_exchanges += res
+                                shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
+                                shared_ref = next(iter(agents.values()))
+                                shared_ref.load_actor_state(shadow_mean)
+                                del shadow_mean
+                            comm_bytes = centralized.bytes_transferred
+                    elif mode == "p2p":
+                        if cfg.p2p.async_exchange:
                             exchange_future = exchange_executor.submit(
                                 p2p.maybe_exchange,
                                 step_idx=step,
-                                agents=shadow_agents,
+                                agents=agents,
                                 positions=positions,
                                 progress=progress,
                                 malicious_nodes=malicious_nodes,
@@ -329,7 +407,7 @@ def run_experiment(
                         else:
                             res = p2p.maybe_exchange(
                                 step_idx=step,
-                                agents=shadow_agents,
+                                agents=agents,
                                 positions=positions,
                                 progress=progress,
                                 malicious_nodes=malicious_nodes,
@@ -344,81 +422,24 @@ def run_experiment(
                             exchanges += res
                             epoch_exchanges += res
                         comm_bytes = p2p.bytes_transferred
-                        shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
-                        shared_ref.load_actor_state(shadow_mean)
                     elif mode == "centralized":
                         if cfg.p2p.async_exchange:
-                            if exchange_future is not None and not exchange_future.done():
-                                res = exchange_future.result()
-                                exchanges += res
-                                epoch_exchanges += res
                             exchange_future = exchange_executor.submit(
                                 centralized.maybe_aggregate,
                                 step_idx=step,
-                                agents=shadow_agents,
+                                agents=agents,
                             )
                         else:
-                            res = centralized.maybe_aggregate(step_idx=step, agents=shadow_agents)
+                            res = centralized.maybe_aggregate(step_idx=step, agents=agents)
                             exchanges += res
                             epoch_exchanges += res
                         comm_bytes = centralized.bytes_transferred
-                        shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
-                        shared_ref.load_actor_state(shadow_mean)
-                elif mode == "p2p":
-                    if cfg.p2p.async_exchange:
-                        if exchange_future is not None and not exchange_future.done():
-                            res = exchange_future.result()
-                            exchanges += res
-                            epoch_exchanges += res
-                        exchange_future = exchange_executor.submit(
-                            p2p.maybe_exchange,
-                            step_idx=step,
-                            agents=agents,
-                            positions=positions,
-                            progress=progress,
-                            malicious_nodes=malicious_nodes,
-                            attack_type=attack_type,
-                            defense_enabled=defense_enabled,
-                            defense_strategy=defense_strategy,
-                            defense_trim_ratio=defense_trim_ratio,
-                            defense_krum_malicious=defense_krum_malicious,
-                            calibration_steps=calibration_steps,
-                            attack_start_step=attack_start_step,
-                        )
-                    else:
-                        res = p2p.maybe_exchange(
-                            step_idx=step,
-                            agents=agents,
-                            positions=positions,
-                            progress=progress,
-                            malicious_nodes=malicious_nodes,
-                            attack_type=attack_type,
-                            defense_enabled=defense_enabled,
-                            defense_strategy=defense_strategy,
-                            defense_trim_ratio=defense_trim_ratio,
-                            defense_krum_malicious=defense_krum_malicious,
-                            calibration_steps=calibration_steps,
-                            attack_start_step=attack_start_step,
-                        )
-                        exchanges += res
-                        epoch_exchanges += res
-                    comm_bytes = p2p.bytes_transferred
-                elif mode == "centralized":
-                    if cfg.p2p.async_exchange:
-                        if exchange_future is not None and not exchange_future.done():
-                            res = exchange_future.result()
-                            exchanges += res
-                            epoch_exchanges += res
-                        exchange_future = exchange_executor.submit(
-                            centralized.maybe_aggregate,
-                            step_idx=step,
-                            agents=agents,
-                        )
-                    else:
-                        res = centralized.maybe_aggregate(step_idx=step, agents=agents)
-                        exchanges += res
-                        epoch_exchanges += res
-                    comm_bytes = centralized.bytes_transferred
+                else:
+                    # Update comm_bytes for logging even on non-exchange steps
+                    if mode == "p2p":
+                        comm_bytes = p2p.bytes_transferred
+                    elif mode == "centralized":
+                        comm_bytes = centralized.bytes_transferred
                 
                 exchange_end = time.time()
                 total_exchange_time += (exchange_end - exchange_start)
@@ -478,7 +499,9 @@ def run_experiment(
                         train_pct = (total_train_time / elapsed_total * 100) if elapsed_total > 0 else 0
                         exchange_pct = (total_exchange_time / elapsed_total * 100) if elapsed_total > 0 else 0
                         
-                        train_label = "train" if shared_agent else f"train(r{step % num_robots})"
+                        # Use the actual robot index that was trained in this step
+                        actual_rid_trained = step % num_robots
+                        train_label = "train" if shared_agent else f"train(r{actual_rid_trained})"
                         print(
                             f"[{mode}] epoch={epoch+1}/{cfg.max_epochs} step={current_step}/{cfg.max_timesteps} | "
                             f"eps={episodes} rew={cumulative_reward:.2f} "

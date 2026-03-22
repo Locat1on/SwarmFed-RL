@@ -64,10 +64,10 @@ class DeepMLP(nn.Module):
 
 
 class Radar1DEncoder(nn.Module):
-    def __init__(self, out_dim: int) -> None:
+    def __init__(self, out_dim: int, in_channels: int = 1) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -78,14 +78,20 @@ class Radar1DEncoder(nn.Module):
         )
 
     def forward(self, radar: torch.Tensor) -> torch.Tensor:
-        # radar: [B, 24]
-        return self.net(radar.unsqueeze(1))
+        # radar: [B, 24 * frame_stack] -> [B, frame_stack, 24]
+        # Assuming radar is flattened as [frame1, frame2, ...], we reshape it
+        # so that channels represent time/frames.
+        b_size = radar.shape[0]
+        # Calculate frame_stack dynamically based on input shape assuming 24 bins per frame
+        in_channels = radar.shape[1] // 24
+        reshaped_radar = radar.view(b_size, in_channels, 24)
+        return self.net(reshaped_radar)
 
 
 class RadarAttentionEncoder(nn.Module):
-    def __init__(self, out_dim: int, model_dim: int, heads: int, layers: int) -> None:
+    def __init__(self, out_dim: int, model_dim: int, heads: int, layers: int, in_channels: int = 1) -> None:
         super().__init__()
-        self.in_proj = nn.Linear(1, model_dim)
+        self.in_proj = nn.Linear(in_channels, model_dim)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
             nhead=heads,
@@ -102,9 +108,16 @@ class RadarAttentionEncoder(nn.Module):
         )
 
     def forward(self, radar: torch.Tensor) -> torch.Tensor:
-        # radar: [B, 24] -> tokens [B, 24, 1]
-        tokens = radar.unsqueeze(-1)
-        h = self.in_proj(tokens)
+        # radar: [B, 24 * frame_stack] -> [B, 24, frame_stack]
+        b_size = radar.shape[0]
+        in_channels = radar.shape[1] // 24
+        
+        # Reshape to treat spatial bins as sequence length, and time frames as features (channels)
+        # [B, 24, frame_stack]
+        reshaped_radar = radar.view(b_size, in_channels, 24).transpose(1, 2)
+        
+        # tokens: [B, 24, in_channels]
+        h = self.in_proj(reshaped_radar)
         h = self.encoder(h)
         pooled = h.mean(dim=1)
         return self.out_proj(pooled)
@@ -132,16 +145,28 @@ class Actor(nn.Module):
             raise ValueError(f"Unsupported actor encoder: {self.encoder_type}")
         if use_cnn_encoder and self.encoder_type == "mlp":
             self.encoder_type = "cnn"
-        self.radar_dim = max(24, state_dim - 4)
-        self.tail_dim = max(0, state_dim - self.radar_dim)
+            
+        # state_dim is typically 24 * frame_stack + 4 (linear_v, angular_v, goal_x, goal_y)
+        self.tail_dim = 4
+        self.radar_dim = max(24, state_dim - self.tail_dim)
+        
+        # Ensure radar_dim is a multiple of 24
+        if self.radar_dim % 24 != 0:
+            # Fallback if state format is non-standard
+            self.radar_dim = state_dim - self.tail_dim
+            
+        frame_stack = self.radar_dim // 24 if self.radar_dim % 24 == 0 else 1
+
         if self.encoder_type in {"attention", "cnn"} and state_dim < self.radar_dim:
             raise ValueError("state_dim must be >= 24 when actor encoder uses radar split")
+            
         if self.encoder_type == "attention":
             self.radar_encoder = RadarAttentionEncoder(
                 out_dim=hidden // 2,
                 model_dim=attention_dim,
                 heads=attention_heads,
                 layers=attention_layers,
+                in_channels=frame_stack
             )
             self.tail_encoder = nn.Sequential(
                 nn.Linear(self.tail_dim, hidden // 2),
@@ -149,7 +174,10 @@ class Actor(nn.Module):
             )
             self.backbone = DeepMLP(hidden, hidden, hidden, hidden_layers, residual)
         elif self.encoder_type == "cnn":
-            self.radar_encoder = Radar1DEncoder(out_dim=hidden // 2)
+            self.radar_encoder = Radar1DEncoder(
+                out_dim=hidden // 2, 
+                in_channels=frame_stack
+            )
             self.tail_encoder = nn.Sequential(
                 nn.Linear(self.tail_dim, hidden // 2),
                 nn.ReLU(),
@@ -344,6 +372,7 @@ class SACAgent:
         self.autocast_device_type = "cuda" if self.device.type == "cuda" else "cpu"
         self.scaler = GradScaler("cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
         self._train_call_count = 0
+        self._gradient_step_count = 0
         self.effective_update_every = max(1, self.cfg.sac.update_every if self.device.type == "cuda" else 1)
         self.effective_gradient_updates = max(
             1, self.cfg.sac.gradient_updates if self.device.type == "cuda" else 1
@@ -403,25 +432,30 @@ class SACAgent:
         high = np.asarray(self.cfg.action_high, dtype=np.float32)
         return low + (tanh_actions + 1.0) * (high - low) / 2.0
 
-    def train_step(self) -> dict[str, float]:
-        self._train_call_count += 1
+    def train_step(self, num_updates: int = 1, pull_metrics: bool = False) -> dict[str, float]:
         if self.buffer.size < max(self.cfg.sac.batch_size, self.cfg.sac.update_after):
             return {}
-        if self._train_call_count % self.effective_update_every != 0:
+        
+        # Check update cadence based on the 'call' count, not internal updates
+        if (self._train_call_count + 1) % self.effective_update_every != 0:
+            self._train_call_count += 1
             return {}
 
+        self._train_call_count += 1
         last_metrics: dict[str, float] = {}
-        for _ in range(self.effective_gradient_updates):
-            last_metrics = self._train_step_once()
+        for i in range(num_updates):
+            is_last = (i == num_updates - 1)
+            # Internal counter handles the sub-step logic
+            last_metrics = self._train_step_once(return_metrics=(is_last and pull_metrics))
+        
         self.scaler.update()
         self._soft_update(self.q1, self.q1_target)
         self._soft_update(self.q2, self.q2_target)
         return last_metrics
 
-    def _train_step_once(self) -> dict[str, float]:
-        if self.buffer.size < max(self.cfg.sac.batch_size, self.cfg.sac.update_after):
-            return {}
-
+    def _train_step_once(self, return_metrics: bool = True) -> dict[str, float]:
+        # Track individual gradient steps for actor update frequency
+        self._gradient_step_count += 1
         state, action, reward, next_state, done = self.buffer.sample(self.cfg.sac.batch_size, self.device)
 
         with torch.no_grad():
@@ -436,47 +470,45 @@ class SACAgent:
         with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
             q1_loss = F.mse_loss(self.q1(state, action), target_q)
             q2_loss = F.mse_loss(self.q2(state, action), target_q)
-        self._safe_loss(q1_loss, "q1_loss")
-        self._safe_loss(q2_loss, "q2_loss")
-        self.q1_opt.zero_grad()
+        
+        self.q1_opt.zero_grad(set_to_none=True)
         self.scaler.scale(q1_loss).backward()
         self.scaler.unscale_(self.q1_opt)
         torch.nn.utils.clip_grad_norm_(self.q1.parameters(), self.cfg.sac.grad_clip_norm)
         self.scaler.step(self.q1_opt)
-        self.q1_opt.zero_grad(set_to_none=True)
+
         self.q2_opt.zero_grad(set_to_none=True)
         self.scaler.scale(q2_loss).backward()
         self.scaler.unscale_(self.q2_opt)
         torch.nn.utils.clip_grad_norm_(self.q2.parameters(), self.cfg.sac.grad_clip_norm)
         self.scaler.step(self.q2_opt)
 
-        # Delayed policy update: only update actor every N critic updates
-        update_actor = (self._train_call_count % self.cfg.sac.actor_update_interval) == 0
         actor_loss_val = 0.0
-        if update_actor:
+        if (self._gradient_step_count % self.cfg.sac.actor_update_interval) == 0:
             with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
                 pi, logp = self.actor.sample(state)
                 q_pi = torch.min(self.q1(state, pi), self.q2(state, pi))
                 actor_loss = (self.alpha * logp - q_pi).mean()
-            self._safe_loss(actor_loss, "actor_loss")
-            self.actor_opt.zero_grad()
+            
+            self.actor_opt.zero_grad(set_to_none=True)
             self.scaler.scale(actor_loss).backward()
             self.scaler.unscale_(self.actor_opt)
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.sac.grad_clip_norm)
             self.scaler.step(self.actor_opt)
-            actor_loss_val = float(actor_loss.item())
+            
+            if return_metrics:
+                actor_loss_val = float(actor_loss.item())
 
             with autocast(self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
                 pi_for_alpha, logp_for_alpha = self.actor.sample(state)
                 alpha_loss = -(self.log_alpha * (logp_for_alpha + self.target_entropy).detach()).mean()
-            self._safe_loss(alpha_loss, "alpha_loss")
-            self.alpha_opt.zero_grad()
+            
+            self.alpha_opt.zero_grad(set_to_none=True)
             alpha_loss.backward()
-            torch.nn.utils.clip_grad_norm_([self.log_alpha], self.cfg.sac.grad_clip_norm)
             self.alpha_opt.step()
 
-        # scaler.update() and soft_update moved to train_step() to avoid
-        # redundant calls during gradient accumulation loop
+        if not return_metrics:
+            return {}
 
         return {
             "q1_loss": float(q1_loss.item()),

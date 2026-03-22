@@ -68,6 +68,8 @@ def main() -> None:
     parser.add_argument("--disable-grid-index", action="store_true", help="Disable P2P grid-based neighbor candidate indexing")
     parser.add_argument("--grid-cell-size", type=float, default=2.0, help="Grid cell size for P2P neighbor indexing")
     parser.add_argument("--actor-update-interval", type=int, default=2, help="Delayed policy update: update actor every N critic updates")
+    parser.add_argument("--sac-gradient-updates", type=int, default=None, help="Number of gradient updates per train step")
+    parser.add_argument("--sac-batch-size", type=int, default=None, help="SAC training batch size")
     parser.add_argument("--disable-fp16-comm", action="store_true", help="Disable FP16 quantization for P2P communication (default: enabled)")
     parser.add_argument("--layer-diff-threshold", type=float, default=0.001, help="Selective layer exchange threshold (0 = exchange all layers)")
     parser.add_argument("--disable-async-exchange", action="store_true", help="Disable asynchronous P2P exchange (default: enabled)")
@@ -205,6 +207,8 @@ def main() -> None:
                 use_fp16_comm=(not args.disable_fp16_comm),
                 layer_diff_threshold=args.layer_diff_threshold,
                 async_exchange=(not args.disable_async_exchange),
+                sac_gradient_updates=args.sac_gradient_updates,
+                sac_batch_size=args.sac_batch_size,
             )
             print(
                 "Experiment finished | "

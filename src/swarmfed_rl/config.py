@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -112,6 +113,8 @@ def build_config(
     layer_diff_threshold: float | None = None,
     async_exchange: bool | None = None,
     beta_schedule: str | None = None,
+    sac_gradient_updates: int | None = None,
+    sac_batch_size: int | None = None,
 ) -> ExperimentConfig:
     base = ExperimentConfig()
     frame_stack_val = max(1, int(frame_stack if frame_stack is not None else base.frame_stack))
@@ -126,7 +129,7 @@ def build_config(
         actor_lr=base.sac.actor_lr,
         critic_lr=base.sac.critic_lr,
         alpha_lr=base.sac.alpha_lr,
-        batch_size=base.sac.batch_size,
+        batch_size=sac_batch_size if sac_batch_size is not None else base.sac.batch_size,
         buffer_size=base.sac.buffer_size,
         hidden_size=base.sac.hidden_size,
         hidden_layers=base.sac.hidden_layers,
@@ -139,7 +142,7 @@ def build_config(
         warmup_steps=base.sac.warmup_steps,
         update_after=base.sac.update_after,
         update_every=base.sac.update_every,
-        gradient_updates=base.sac.gradient_updates,
+        gradient_updates=sac_gradient_updates if sac_gradient_updates is not None else base.sac.gradient_updates,
         log_std_min=base.sac.log_std_min,
         log_std_max=base.sac.log_std_max,
         grad_clip_norm=base.sac.grad_clip_norm,
@@ -187,7 +190,7 @@ def build_config(
     
     if max_timesteps is not None:
         calc_timesteps = max_timesteps
-        final_max_epochs = max(1, calc_timesteps // final_steps_per_epoch)
+        final_max_epochs = max(1, math.ceil(calc_timesteps / final_steps_per_epoch))
     elif max_epochs is not None:
         final_max_epochs = max_epochs
         calc_timesteps = final_max_epochs * final_steps_per_epoch

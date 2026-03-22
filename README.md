@@ -318,7 +318,31 @@ python scripts/run_experiment.py \
 
 ---
 
-## 性能调优与故障排除
+## 标准对比实验方案（学术方案）
+
+为了验证 P2P 联邦学习及动态 $\beta$ 权重的有效性，建议按以下顺序运行对照实验。所有实验均采用统一的 5 机器人、8 障碍物环境。
+
+### 1. 实验指令集
+
+| 实验组别 | 核心验证点 | 启动指令 |
+| :--- | :--- | :--- |
+| **独立训练 (Local)** | 无通信基准 | `python scripts/run_experiment.py --mode local --robots 5 --epochs 50 --steps-per-epoch 4000 --num-obstacles 8 --obstacle-radius 0.35 --gpu-replay-buffer --run-name comp_local` |
+| **中心联邦 (FedAvg)** | 全局同步效果 | `python scripts/run_experiment.py --mode centralized --robots 5 --epochs 50 --steps-per-epoch 4000 --num-obstacles 8 --obstacle-radius 0.35 --gpu-replay-buffer --run-name comp_fedavg` |
+| **固定 P2P (Static)** | 局部交换效果 | `python scripts/run_experiment.py --mode p2p --beta-schedule constant --robots 5 --epochs 50 --steps-per-epoch 4000 --num-obstacles 8 --obstacle-radius 0.35 --gpu-replay-buffer --run-name comp_p2p_static` |
+| **动态 P2P (Dynamic)** | 进度感知聚合效果 | `python scripts/run_experiment.py --mode p2p --beta-schedule linear --robots 5 --epochs 50 --steps-per-epoch 4000 --num-obstacles 8 --obstacle-radius 0.35 --gpu-replay-buffer --run-name comp_p2p_dynamic` |
+
+### 2. 关键对比指标（分析方法）
+
+运行完上述指令后，请进入 `artifacts/plots/` 目录下对比各实验组的图表：
+
+1.  **学习速度（Convergence）**：对比各组 `reward_trend.png`。动态 P2P 通常能比 Local 更快让奖励值“由负转正”。
+2.  **避障安全性（Safety）**：对比 `epoch_metrics.png` 中的 `epoch_collisions`。观察联邦学习是否能显著降低训练中后期的碰撞频率。
+3.  **最终性能（Final Success Rate）**：查看 `*_epoch.csv` 最后一个 Epoch 的成功率。
+4.  **通信负载（Comm. Efficiency）**：对比 `communication_overhead.png`。P2P 模式的通信字节数应远低于 Centralized 模式。
+
+---
+
+## 统一 artifacts 输出结构
 
 ### P2P通信过于频繁（P2P占比>20%）
 
