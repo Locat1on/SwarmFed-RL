@@ -229,8 +229,6 @@ def run_experiment(
                     next_state, reward, done, info = env.step(action)
                 normalized_action = _normalize_action(action, cfg.action_low, cfg.action_high)
                 agent.buffer.push(state, normalized_action.astype(np.float32), reward, next_state, done)
-                if not shared_agent:
-                    agent.train_step()
                 states[rid] = env.reset() if done else next_state
                 positions[rid] = env.get_position()
 
@@ -244,12 +242,15 @@ def run_experiment(
                     successes += 1
                 if bool(info["collision"]):
                     collisions += 1
-            
+
             env_step_end = time.time()
             total_env_time += (env_step_end - env_step_start)
 
             # Training and exchange
             train_start = time.time()
+            if not shared_agent:
+                for rid in range(num_robots):
+                    agents[rid].train_step()
             if shared_agent:
                 shared_ref = next(iter(agents.values()))
                 shared_ref.train_step()
