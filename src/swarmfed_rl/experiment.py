@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,8 +174,17 @@ def run_experiment(
     if cfg.p2p.async_exchange and mode in {"p2p", "centralized"}:
         exchange_executor = ThreadPoolExecutor(max_workers=1)
 
+    # Performance tracking
+    step_start_time = time.time()
+    last_log_time = step_start_time
+    steps_since_last_log = 0
+    total_env_time = 0.0
+    total_train_time = 0.0
+    total_exchange_time = 0.0
+
     try:
         for step in range(cfg.max_timesteps):
+            iter_start = time.time()
             positions: dict[int, np.ndarray] = {}
             step_reward = 0.0
             actions_by_rid: dict[int, np.ndarray] = {}
@@ -189,6 +199,8 @@ def run_experiment(
                     rid: agents[rid].select_action(states[rid], deterministic=False) for rid in range(num_robots)
                 }
 
+            # Environment stepping
+            env_step_start = time.time()
             if step_executor is not None:
                 step_futures = {
                     rid: step_executor.submit(
@@ -222,18 +234,33 @@ def run_experiment(
                 if done:
                     episodes += 1
                     completed_ep_returns.append(current_ep_rewards[rid])
+                    # Limit list size to prevent memory growth
+                    if len(completed_ep_returns) > 1000:
+                        completed_ep_returns.pop(0)
                     current_ep_rewards[rid] = 0.0
                 if bool(info["success"]):
                     successes += 1
                 if bool(info["collision"]):
                     collisions += 1
+            
+            env_step_end = time.time()
+            total_env_time += (env_step_end - env_step_start)
 
+            # Training and exchange
+            train_start = time.time()
             if shared_agent:
                 shared_ref = next(iter(agents.values()))
                 shared_ref.train_step()
                 shared_state = shared_ref.get_actor_state(cpu_clone=False)
                 for sa in shadow_agents.values():
                     sa.load_actor_state(shared_state)
+                
+            train_end = time.time()
+            total_train_time += (train_end - train_start)
+            
+            # P2P exchange
+            exchange_start = time.time()
+            if shared_agent:
                 if mode == "p2p":
                     if cfg.p2p.async_exchange:
                         # Wait for previous exchange to complete
@@ -334,10 +361,19 @@ def run_experiment(
                 comm_bytes = centralized.bytes_transferred
             else:
                 comm_bytes = 0
+            
+            exchange_end = time.time()
+            total_exchange_time += (exchange_end - exchange_start)
 
             cumulative_reward += step_reward
             episode_return_mean = mean(completed_ep_returns) if completed_ep_returns else 0.0
             latest_episode_return = completed_ep_returns[-1] if completed_ep_returns else None
+            
+            # Performance metrics
+            iter_end = time.time()
+            iter_time = iter_end - iter_start
+            steps_since_last_log += 1
+            
             _write_step_row(
                 csv_writer=csv_writer,
                 file_handle=csv_file,
@@ -375,13 +411,34 @@ def run_experiment(
             if progress_every is not None and progress_every > 0:
                 current_step = step + 1
                 if current_step == 1 or current_step % progress_every == 0 or current_step == cfg.max_timesteps:
+                    now = time.time()
+                    elapsed_total = now - step_start_time
+                    elapsed_since_last = now - last_log_time
+                    steps_per_sec = steps_since_last_log / elapsed_since_last if elapsed_since_last > 0 else 0
+                    
+                    # Breakdown percentages
+                    env_pct = (total_env_time / elapsed_total * 100) if elapsed_total > 0 else 0
+                    train_pct = (total_train_time / elapsed_total * 100) if elapsed_total > 0 else 0
+                    exchange_pct = (total_exchange_time / elapsed_total * 100) if elapsed_total > 0 else 0
+                    
+                    # Buffer stats
+                    sample_agent = next(iter(agents.values()))
+                    buffer_size = sample_agent.buffer.size
+                    buffer_capacity = sample_agent.buffer.capacity if hasattr(sample_agent.buffer, 'capacity') else sample_agent.cfg.sac.buffer_size
+                    buffer_usage_pct = (buffer_size / buffer_capacity * 100) if buffer_capacity > 0 else 0
+                    
                     print(
-                        f"[{mode}] step={current_step}/{cfg.max_timesteps} "
-                        f"episodes={episodes} reward={cumulative_reward:.2f} "
-                        f"succ={successes} coll={collisions} "
-                        f"exchanges={exchanges} bytes={comm_bytes}",
+                        f"[{mode}] step={current_step}/{cfg.max_timesteps} | "
+                        f"eps={episodes} rew={cumulative_reward:.2f} "
+                        f"succ={successes} coll={collisions} | "
+                        f"exch={exchanges} bytes={comm_bytes/1e6:.1f}MB | "
+                        f"speed={steps_per_sec:.2f}step/s ({elapsed_since_last:.1f}s) | "
+                        f"buf={buffer_usage_pct:.0f}% | "
+                        f"time: env={env_pct:.0f}% train={train_pct:.0f}% p2p={exchange_pct:.0f}%",
                         flush=True,
                     )
+                    last_log_time = now
+                    steps_since_last_log = 0
         # Finalize any pending async exchanges
         if exchange_future is not None and not exchange_future.done():
             exchanges += exchange_future.result()
