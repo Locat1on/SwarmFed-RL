@@ -265,9 +265,14 @@ class P2PAggregator:
                         distance=dist_ab,
                     )
                 )
-                self._last_exchange[(a, b)] = step_idx
+                with self._lock:
+                    self._last_exchange[(a, b)] = step_idx
                 exchanges += 1
 
+        with self._lock:
+            self.bytes_transferred += local_bytes_transferred
+
+        merged_states = {}
         for rid in ids:
             if rid not in incoming:
                 continue
@@ -285,8 +290,8 @@ class P2PAggregator:
             # Dequantize if using FP16 comm
             if self.cfg.use_fp16_comm:
                 merged = dequantize_state_fp16(merged)
-            agents[rid].load_actor_state(merged)
-        return exchanges
+            merged_states[rid] = merged
+        return exchanges, merged_states
 
     def _candidate_pairs(
         self,
@@ -512,11 +517,11 @@ class CentralizedFedAvg:
         self.beta = beta
         self.bytes_transferred = 0
 
-    def maybe_aggregate(self, step_idx: int, agents: dict[int, SACAgent]) -> int:
+    def maybe_aggregate(self, step_idx: int, agents: dict[int, SACAgent]) -> tuple[int, dict[int, dict[str, torch.Tensor]]]:
         if step_idx % self.interval_steps != 0:
-            return 0
+            return 0, {}
         if not agents:
-            return 0
+            return 0, {}
 
         ids = sorted(agents.keys())
         states = {rid: agents[rid].get_actor_state() for rid in ids}
@@ -531,10 +536,11 @@ class CentralizedFedAvg:
             payload_one_way += merged[k].numel() * merged[k].element_size()
         self.bytes_transferred += payload_one_way * (len(ids) * 2)
 
+        merged_states = {}
         for rid in ids:
             blended = self._blend(agents[rid].get_actor_state(), merged)
-            agents[rid].load_actor_state(blended)
-        return 1
+            merged_states[rid] = blended
+        return 1, merged_states
 
     def _blend(
         self,

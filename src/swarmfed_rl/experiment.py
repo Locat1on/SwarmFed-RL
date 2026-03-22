@@ -224,6 +224,7 @@ def run_experiment(
                 actions_by_rid: dict[int, np.ndarray] = {}
                 
                 # 1. Action Selection
+                action_start = time.time()
                 actions_by_rid: dict[int, np.ndarray] = {}
                 if shared_agent:
                     shared = next(iter(agents.values()))
@@ -235,6 +236,9 @@ def run_experiment(
                     actions_by_rid = {
                         rid: agents[rid].select_action(states[rid], deterministic=False) for rid in range(num_robots)
                     }
+                action_end = time.time()
+                # Attribute action selection time to training/inference time
+                total_train_time += (action_end - action_start)
 
                 # 2. Environment stepping
                 env_step_start = time.time()
@@ -285,29 +289,38 @@ def run_experiment(
                 # calculating new gradients to prevent state corruption.
                 exchange_start = time.time()
                 if exchange_future is not None and exchange_future.done():
-                    res = exchange_future.result()
+                    res, merged_states = exchange_future.result()
                     exchanges += res
                     epoch_exchanges += res
                     exchange_future = None
                     
-                    # If using shared agent, we must apply the merged shadow weights NOW
                     if shared_agent and mode in {"p2p", "centralized"}:
+                        for rid, state in merged_states.items():
+                            shadow_agents[rid].load_actor_state(state)
                         shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
                         shared_ref = next(iter(agents.values()))
                         shared_ref.load_actor_state(shadow_mean)
                         del shadow_mean
+                    elif mode in {"p2p", "centralized"}:
+                        for rid, state in merged_states.items():
+                            agents[rid].load_actor_state(state)
                 
                 # If we hit an exchange interval but the previous one isn't done, force wait
                 if step % cfg.p2p.exchange_interval_steps == 0 and exchange_future is not None:
-                    res = exchange_future.result()
+                    res, merged_states = exchange_future.result()
                     exchanges += res
                     epoch_exchanges += res
                     exchange_future = None
                     if shared_agent and mode in {"p2p", "centralized"}:
+                        for rid, state in merged_states.items():
+                            shadow_agents[rid].load_actor_state(state)
                         shadow_mean = _average_actor_state(shadow_agents, cpu_clone=False)
                         shared_ref = next(iter(agents.values()))
                         shared_ref.load_actor_state(shadow_mean)
                         del shadow_mean
+                    elif mode in {"p2p", "centralized"}:
+                        for rid, state in merged_states.items():
+                            agents[rid].load_actor_state(state)
 
                 # 4. Training
                 train_start = time.time()
