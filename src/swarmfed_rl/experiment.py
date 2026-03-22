@@ -284,17 +284,19 @@ def run_experiment(
                 # Training and exchange
                 train_start = time.time()
                 if not shared_agent:
+                    # Optimized Staggered Training:
+                    # Instead of training 1 robot N times (high Python overhead),
+                    # we train the scheduled robot once per environment step.
+                    # The intensity is controlled via SACConfig (gradient_updates).
                     rid_to_train = step % num_robots
-                    for _ in range(num_robots):
-                        agents[rid_to_train].train_step()
-                if shared_agent:
+                    agents[rid_to_train].train_step()
+                else:
                     shared_ref = next(iter(agents.values()))
                     shared_ref.train_step()
                     if mode in {"p2p", "centralized"} and step % cfg.p2p.exchange_interval_steps == 0:
                         shared_state = shared_ref.get_actor_state(cpu_clone=False)
                         for sa in shadow_agents.values():
                             sa.load_actor_state(shared_state)
-                    
                 train_end = time.time()
                 total_train_time += (train_end - train_start)
                 
