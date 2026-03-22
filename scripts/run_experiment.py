@@ -35,7 +35,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run local/centralized/p2p experiments")
     parser.add_argument("--mode", choices=["local", "centralized", "p2p"], default="p2p")
     parser.add_argument("--robots", type=int, default=3)
-    parser.add_argument("--timesteps", type=int, default=5_000)
+    parser.add_argument("--timesteps", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--steps-per-epoch", type=int, default=2000)
+    parser.add_argument("--num-obstacles", type=int, default=5)
+    parser.add_argument("--obstacle-radius", type=float, default=0.3)
+    parser.add_argument("--beta-schedule", choices=["constant", "linear", "exponential"], default="constant")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-csv", type=str, default=None, help="Path to log CSV (default: auto-generated in artifacts/logs/)")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
@@ -166,6 +171,11 @@ def main() -> None:
                 mode=args.mode,
                 num_robots=args.robots,
                 max_timesteps=args.timesteps,
+                max_epochs=args.epochs,
+                steps_per_epoch=args.steps_per_epoch,
+                num_obstacles=args.num_obstacles,
+                obstacle_radius=args.obstacle_radius,
+                beta_schedule=args.beta_schedule,
                 seed=args.seed,
                 log_csv_path=str(log_csv_path),
                 checkpoint_dir=checkpoint_dir,

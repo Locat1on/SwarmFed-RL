@@ -61,6 +61,7 @@ class IncomingCandidate:
     sender_id: int
     state: dict[str, torch.Tensor]
     sender_is_malicious: bool
+    distance: float = 0.0
 
 
 class RunningStat:
@@ -87,12 +88,20 @@ def cosine_similarity_state_dict(
     state_a: dict[str, torch.Tensor],
     state_b: dict[str, torch.Tensor],
 ) -> float:
-    a = torch.cat([v.reshape(-1).float() for v in state_a.values()], dim=0)
-    b = torch.cat([v.reshape(-1).float() for v in state_b.values()], dim=0)
-    denom = torch.norm(a, p=2) * torch.norm(b, p=2)
-    if float(denom.item()) == 0.0:
+    dot_product = 0.0
+    norm_a_sq = 0.0
+    norm_b_sq = 0.0
+    for k in state_a:
+        a_flat = state_a[k].float().view(-1)
+        b_flat = state_b[k].float().view(-1)
+        dot_product += torch.dot(a_flat, b_flat).item()
+        norm_a_sq += torch.sum(a_flat ** 2).item()
+        norm_b_sq += torch.sum(b_flat ** 2).item()
+        
+    denom = (norm_a_sq ** 0.5) * (norm_b_sq ** 0.5)
+    if denom == 0.0:
         return 0.0
-    return float(torch.dot(a, b).item() / denom.item())
+    return dot_product / denom
 
 
 def state_dict_to_vector(state: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -126,13 +135,12 @@ def krum_select_index(vectors: list[torch.Tensor], malicious_count: int) -> int:
     n = len(vectors)
     if n == 0:
         raise ValueError("vectors cannot be empty")
-    # For Krum to work, we need n >= 2*f + 3. 
-    # If not enough neighbors, we can fallback to mean or just return "reject all" (0).
-    # But returning 0 means "reject everything", which is why we saw 0 accepts.
-    # In small swarms or sparse graphs, we should be lenient if n is small.
-    if n <= 2:
-        # Too few to vote, trust the first one (usually local model)
+    if n == 1:
         return 0
+    if n == 2:
+        # If there's only local model and 1 neighbor, and no malicious nodes expected,
+        # we can blindly trust the neighbor to allow learning. Otherwise, trust local.
+        return 1 if malicious_count == 0 else 0
     
     f = max(0, malicious_count)
     # Ensure we select at least 1 neighbor distance
@@ -175,6 +183,7 @@ class P2PAggregator:
         agents: dict[int, SACAgent],
         positions: dict[int, np.ndarray],
         *,
+        progress: float = 0.0,
         malicious_nodes: set[int] | None = None,
         attack_type: str = "zero",
         defense_enabled: bool = False,
@@ -237,11 +246,15 @@ class P2PAggregator:
                     incoming_to_a = {**local_a_fp16, **incoming_to_a_filtered}
                     incoming_to_b = {**local_b_fp16, **incoming_to_b_filtered}
                 
+                # Calculate distance for dynamic beta
+                dist_ab = euclidean_distance(positions[a], positions[b])
+                
                 incoming[a].append(
                     IncomingCandidate(
                         sender_id=b,
                         state=incoming_to_a,
                         sender_is_malicious=(b in malicious_nodes and step_idx >= attack_start_step),
+                        distance=dist_ab,
                     )
                 )
                 incoming[b].append(
@@ -249,6 +262,7 @@ class P2PAggregator:
                         sender_id=a,
                         state=incoming_to_b,
                         sender_is_malicious=(a in malicious_nodes and step_idx >= attack_start_step),
+                        distance=dist_ab,
                     )
                 )
                 self._last_exchange[(a, b)] = step_idx
@@ -260,6 +274,7 @@ class P2PAggregator:
             merged = self._merge_incoming(
                 local_state=current_states[rid],
                 candidates=incoming[rid],
+                progress=progress,
                 defense_enabled=defense_enabled,
                 defense_strategy=defense_strategy,
                 defense_trim_ratio=defense_trim_ratio,
@@ -325,6 +340,7 @@ class P2PAggregator:
         *,
         local_state: dict[str, torch.Tensor],
         candidates: list[IncomingCandidate],
+        progress: float,
         defense_enabled: bool,
         defense_strategy: str,
         defense_trim_ratio: float,
@@ -336,11 +352,13 @@ class P2PAggregator:
             return local_state
 
         if not defense_enabled:
+            # Average distance of all candidates for dynamic beta
+            avg_dist = float(np.mean([c.distance for c in candidates]))
             incoming_mean = aggregate_state_dicts_trimmed_mean(
                 [c.state for c in candidates], trim_ratio=0.0
             )
             self._update_accept_reject_stats(candidates, set(range(len(candidates))))
-            return self._blend(local_state, incoming_mean)
+            return self._blend(local_state, incoming_mean, distance=avg_dist, progress=progress)
 
         if defense_strategy == "cosine":
             accepted: list[IncomingCandidate] = []
@@ -368,12 +386,15 @@ class P2PAggregator:
                     self.defense_stats.accepted_malicious_updates += 1
             if len(accepted) == 0:
                 return local_state
+            
+            avg_dist = float(np.mean([c.distance for c in accepted]))
             incoming_mean = aggregate_state_dicts_trimmed_mean(
                 [c.state for c in accepted], trim_ratio=0.0
             )
-            return self._blend(local_state, incoming_mean)
+            return self._blend(local_state, incoming_mean, distance=avg_dist, progress=progress)
 
         if defense_strategy == "trimmed_mean":
+            avg_dist = float(np.mean([c.distance for c in candidates]))
             incoming_states = [c.state for c in candidates]
             incoming_mean = aggregate_state_dicts_trimmed_mean(
                 incoming_states, trim_ratio=defense_trim_ratio
@@ -381,7 +402,7 @@ class P2PAggregator:
             # Trimmed-mean is element-wise; a sender may be partly used and partly trimmed.
             # Record all senders as accepted at sender-level to avoid misleading "fully rejected" stats.
             self._update_accept_reject_stats(candidates, set(range(len(candidates))))
-            return self._blend(local_state, incoming_mean)
+            return self._blend(local_state, incoming_mean, distance=avg_dist, progress=progress)
 
         # Krum: include local model as a candidate anchor for robust selection.
         krum_pool = [local_state] + [c.state for c in candidates]
@@ -407,7 +428,8 @@ class P2PAggregator:
         
         # Blend with the chosen candidate
         incoming_state = candidates[chosen_candidate_idx].state
-        return self._blend(local_state, incoming_state)
+        dist = candidates[chosen_candidate_idx].distance
+        return self._blend(local_state, incoming_state, distance=dist, progress=progress)
 
     def _update_accept_reject_stats(self, candidates: list[IncomingCandidate], used_indices: set[int]) -> None:
         for idx, c in enumerate(candidates):
@@ -431,8 +453,27 @@ class P2PAggregator:
         self,
         local_state: dict[str, torch.Tensor],
         incoming_state: dict[str, torch.Tensor],
+        distance: float | None = None,
+        progress: float = 0.0,
     ) -> dict[str, torch.Tensor]:
+        # 1. Base beta from schedule or default
         beta = self.cfg.beta
+        if self.cfg.beta_schedule == "linear":
+            beta = self.cfg.beta_max - (self.cfg.beta_max - self.cfg.beta_min) * progress
+        elif self.cfg.beta_schedule == "exponential":
+            if self.cfg.beta_max > 0:
+                beta = self.cfg.beta_max * ((self.cfg.beta_min / self.cfg.beta_max) ** progress)
+        
+        # 2. Refine beta based on distance if enabled
+        # If dynamic_beta is ON, distance-based logic scales the baseline beta
+        if self.cfg.dynamic_beta and distance is not None:
+            normalized_dist = min(distance / self.cfg.comm_radius, 1.0)
+            # Use current scheduled beta as the 'local trust' baseline for nearby robots
+            # and scale down to beta_min for far-away robots.
+            b_high = max(beta, self.cfg.beta_max)
+            b_low = self.cfg.beta_min
+            beta = b_high - (b_high - b_low) * normalized_dist
+        
         out: dict[str, torch.Tensor] = {}
         for k in local_state:
             out[k] = beta * local_state[k] + (1.0 - beta) * incoming_state[k]

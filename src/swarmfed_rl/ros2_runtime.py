@@ -75,7 +75,7 @@ class ChunkReassembler:
             dict[str, object],
         ] = {}
 
-    def add_chunk(self, raw: bytes) -> tuple[ChunkHeader, bytes, int] | None:
+    def add_chunk(self, raw: bytes, current_time: float) -> tuple[ChunkHeader, bytes, int] | None:
         header, chunk_payload = unpack_weights_chunk(raw)
         key = (
             header.sender_id,
@@ -84,15 +84,14 @@ class ChunkReassembler:
             header.payload_len,
             header.payload_crc32,
         )
-        now = time.time()
-        self._cleanup(now)
+        self._cleanup(current_time)
 
         bucket = self._pending.get(key)
         if bucket is None:
             if len(self._pending) >= self.max_pending_messages:
                 self._evict_oldest()
             bucket = {
-                "created_at": now,
+                "created_at": current_time,
                 "chunks": {},
                 "total": header.chunk_total,
                 "raw_bytes": 0,
@@ -401,8 +400,9 @@ class ROS2RLNode(Node):  # pragma: no cover
     def _on_weights(self, msg: ByteMultiArray) -> None:
         raw = bytes(msg.data)
         self.weights_bytes_received += len(raw)
+        now = self.get_clock().now().nanoseconds / 1e9
         try:
-            assembled = self._reassembler.add_chunk(raw)
+            assembled = self._reassembler.add_chunk(raw, now)
             if assembled is None:
                 return
             header, framed_payload, raw_size = assembled
@@ -504,8 +504,12 @@ class ROS2RLNode(Node):  # pragma: no cover
         return total_bytes
 
     def consume_incoming_weights(self) -> list[ReceivedWeights]:
-        packets = list(self._incoming_weights)
-        self._incoming_weights.clear()
+        packets = []
+        while True:
+            try:
+                packets.append(self._incoming_weights.popleft())
+            except IndexError:
+                break
         return packets
 
 

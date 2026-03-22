@@ -65,6 +65,10 @@ class P2PConfig:
     use_fp16_comm: bool = True
     layer_diff_threshold: float = 0.001
     async_exchange: bool = True
+    dynamic_beta: bool = True
+    beta_min: float = 0.3
+    beta_max: float = 0.9
+    beta_schedule: str = "constant"  # constant | linear | exponential
 
 
 @dataclass(frozen=True)
@@ -75,8 +79,12 @@ class ExperimentConfig:
     action_low: tuple[float, float] = (0.0, -1.5)
     action_high: tuple[float, float] = (0.22, 1.5)
     max_timesteps: int = 20_000
+    max_epochs: int = 10
+    steps_per_epoch: int = 2000
     max_episode_steps: int = 400
     goal_threshold: float = 0.25
+    num_obstacles: int = 5
+    obstacle_radius: float = 0.3
     seed: SeedConfig = field(default_factory=SeedConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     sac: SACConfig = field(default_factory=SACConfig)
@@ -87,6 +95,10 @@ def build_config(
     *,
     seed: int | None = None,
     max_timesteps: int | None = None,
+    max_epochs: int | None = None,
+    steps_per_epoch: int | None = None,
+    num_obstacles: int | None = None,
+    obstacle_radius: float | None = None,
     comm_radius: float | None = None,
     cooldown_steps: int | None = None,
     exchange_interval_steps: int | None = None,
@@ -99,6 +111,7 @@ def build_config(
     use_fp16_comm: bool | None = None,
     layer_diff_threshold: float | None = None,
     async_exchange: bool | None = None,
+    beta_schedule: str | None = None,
 ) -> ExperimentConfig:
     base = ExperimentConfig()
     frame_stack_val = max(1, int(frame_stack if frame_stack is not None else base.frame_stack))
@@ -163,16 +176,38 @@ def build_config(
             layer_diff_threshold if layer_diff_threshold is not None else base.p2p.layer_diff_threshold
         ),
         async_exchange=base.p2p.async_exchange if async_exchange is None else bool(async_exchange),
+        beta_schedule=beta_schedule if beta_schedule is not None else base.p2p.beta_schedule,
     )
+    
+    # Priority logic:
+    # 1. If max_timesteps is explicitly provided, it defines the total budget.
+    # 2. Otherwise, use max_epochs * steps_per_epoch.
+    
+    final_steps_per_epoch = steps_per_epoch if steps_per_epoch is not None else base.steps_per_epoch
+    
+    if max_timesteps is not None:
+        calc_timesteps = max_timesteps
+        final_max_epochs = max(1, calc_timesteps // final_steps_per_epoch)
+    elif max_epochs is not None:
+        final_max_epochs = max_epochs
+        calc_timesteps = final_max_epochs * final_steps_per_epoch
+    else:
+        final_max_epochs = base.max_epochs
+        calc_timesteps = base.max_timesteps
+
     return ExperimentConfig(
         state_dim=state_dim_val,
         frame_stack=frame_stack_val,
         action_dim=base.action_dim,
         action_low=base.action_low,
         action_high=base.action_high,
-        max_timesteps=max_timesteps if max_timesteps is not None else base.max_timesteps,
+        max_timesteps=calc_timesteps,
+        max_epochs=final_max_epochs,
+        steps_per_epoch=final_steps_per_epoch,
         max_episode_steps=base.max_episode_steps,
         goal_threshold=base.goal_threshold,
+        num_obstacles=num_obstacles if num_obstacles is not None else base.num_obstacles,
+        obstacle_radius=obstacle_radius if obstacle_radius is not None else base.obstacle_radius,
         seed=seed_cfg,
         reward=base.reward,
         sac=sac_cfg,

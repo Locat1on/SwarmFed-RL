@@ -90,6 +90,33 @@ python scripts/run_ros2_experiment.py --robot-ids 0,1,2 --timesteps 1000 --seed 
 python scripts/smoke_ros2_runtime.py
 ```
 
+## 训练参数推荐（最新功能）
+
+针对新增的**避障环境**、**动态 $\beta$ 权重**以及 **Epoch 计数**功能，建议参考以下配置：
+
+### 1. 基础避障训练（推荐参数）
+这是一个平衡了训练速度、学习质量和避障难度的通用组合：
+
+```bash
+python scripts/run_experiment.py --mode p2p --robots 5 --epochs 50 --steps-per-epoch 4000 --num-obstacles 8 --obstacle-radius 0.35 --beta-schedule linear --exchange-interval-steps 50 --progress-every 500
+```
+
+### 2. 参数选择指南
+
+| 参数 | 建议范围 | 说明 |
+|------|--------|------|
+| `--robots` | 3 - 8 | 建议 5 台左右，既能体现群集优势又不会拖慢仿真速度。 |
+| `--num-obstacles` | 5 - 10 | 8 个为中等难度。若碰撞率无法下降，请先调低至 5 个。 |
+| `--obstacle-radius` | 0.3 - 0.4 | 默认 0.3。设置 0.5 会使环境变得极度拥挤。 |
+| `--epochs` | 50 - 100 | 总步数（Epoch * Steps）建议在 20万 步以上以实现收敛。 |
+| `--beta-schedule` | `linear` | 线性衰减最稳健。前期多吸纳邻居知识，后期专注本地微调。 |
+| `--steps-per-epoch` | 2000 - 5000 | 决定了每个 Epoch 的数据粒度和日志记录频率。 |
+
+### 3. 如何评估训练效果
+- **查看 Epoch 日志**：检查 `artifacts/logs/<mode>/<name>_epoch.csv` 中的 `epoch_successes`。
+- **收敛信号**：当成功率平稳超过 80% 且 `episode_return_mean` 不再剧烈波动时，说明模型已基本学成。
+- **动态 $\beta$ 验证**：在 `linear` 模式下，你会发现训练后期即便有邻居靠近，模型权重的波动也会变小（因为 $\beta$ 变大，更信任本地）。
+
 ## 统一 artifacts 输出结构
 
 默认根目录：`artifacts\`
@@ -412,55 +439,67 @@ grep "step=2000" artifacts/logs/p2p/optimized.log
 
 ---
 
-## 性能模式（5090推荐）
+## 性能模式（5090 极致提速）
 
-若你追求吞吐而非“严格 P2P 实验”：
+如果你处于**算法调优阶段**，或者主要关注**避障策略的鲁棒性**而非“严格的分布式权重交换逻辑”，强烈建议开启 **Shared Agent（共享智能体）** 模式。
 
-```bash
-python scripts/run_experiment.py --mode p2p --robots 30 --timesteps 20000 --shared-agent --progress-every 500
-```
+### 1. 什么是 Shared Agent？
+- **原理**：所有机器人共享同一个神经网络模型。
+- **优势**：每一步仅需进行 1 次反向传播更新，而 P2P 模式下 30 台机器人需进行 30 次更新。
+- **性能**：在 5090 显卡上，速度可从 `5 step/s` 飙升至 `150+ step/s`（约 30 倍提升）。
 
-说明：
-
-- `--shared-agent`：所有机器人共享同一套 Actor/Critic 与回放池；
-- 每步仅执行一次集中更新，显著减少多Agent串行训练的CPU开销；
-- 这是当前代码里最有效的提速模式之一。
-
-注意：严格 P2P 评估应使用“独立 Agent + 交换”。当前脚本在 `--mode p2p` 下会自动禁用 `--shared-agent`，避免实验设定被破坏。
-
-推荐严格 P2P命令：
+### 2. 极致提速启动指令
+使用共享大脑快速验证避障逻辑：
 
 ```bash
-python scripts/run_experiment.py --mode p2p --robots 30 --timesteps 20000 --progress-every 500
+python scripts/run_experiment.py \
+    --mode local \
+    --robots 30 \
+    --epochs 50 \
+    --steps-per-epoch 4000 \
+    --num-obstacles 8 \
+    --shared-agent \
+    --gpu-replay-buffer \
+    --progress-every 500
 ```
 
-## 常见问题
+### 3. 模式选择建议
+
+| 需求场景 | 推荐模式 | 是否开启 `--shared-agent` |
+|------|--------|------|
+| **论文数据采集**（验证联邦学习性能） | `p2p` | **否** (必须使用独立 Agent) |
+| **避障策略预训练**（快速获得基础模型） | `local` | **是** |
+| **大规模机器人压力测试**（100+ 机器人） | `local` | **是** |
+
+---
+
+## 统一 artifacts 输出结构
 
 ### 性能相关
 
-- **P2P通信占比过高（>20%）？**  
+- **P2P通信占比过高（>20%）？**
   参见上方"性能调优与故障排除"章节的方案A/B，大幅降低 `exchange-interval-steps` 和 `cooldown-steps`。
 
-- **训练越来越慢？**  
+- **训练越来越慢？**
   使用 `grep "step=" your_log.log` 查看速度趋势。如果持续下降，检查 P2P 时间占比或更新代码（已修复内存泄漏）。
 
-- **GPU利用率低？**  
+- **GPU利用率低？**
   增加 `--env-step-workers` 充分利用CPU多核，或启用 `--gpu-replay-buffer`。
 
 ### 训练相关
 
-- **Reward 一直是负的？**  
+- **Reward 一直是负的？**
   训练初期常见。每步惩罚 + 碰撞惩罚会压低总奖励。请看 `episode_return_mean` 和成功率/碰撞率趋势，而不是只看累计和。
 
-- **30 台机器人会不会太卡？**  
+- **30 台机器人会不会太卡？**
   真实 ROS2/Gazebo 常见瓶颈在 CPU 仿真与通信。建议先 headless、降低传感器频率、控制日志频率。
 
 ### 日志解读
 
-- **如何看懂新版日志？**  
+- **如何看懂新版日志？**
   ```
-  [p2p] step=2000/20000 | eps=125 rew=-1523.4 succ=12 coll=8 | 
-        exch=145 bytes=38.2MB | speed=12.34step/s (162.0s) | buf=65% | 
+  [p2p] step=2000/20000 | eps=125 rew=-1523.4 succ=12 coll=8 |
+        exch=145 bytes=38.2MB | speed=12.34step/s (162.0s) | buf=65% |
         time: env=45% train=35% p2p=15%
   ```
   - `speed`: 当前训练速度（step/s）
@@ -468,5 +507,5 @@ python scripts/run_experiment.py --mode p2p --robots 30 --timesteps 20000 --prog
   - `time`: 时间分布（env=环境交互，train=SAC训练，p2p=通信聚合）
   - 理想状态：`env 40-50%`, `train 30-40%`, `p2p <10%`
 
-- **如何退出 ROS2 launch 卡住？**  
+- **如何退出 ROS2 launch 卡住？**
   若多次 `Ctrl+C` 不退出，另开终端按 PID 精确结束进程（避免按进程名批量杀）。

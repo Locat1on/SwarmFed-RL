@@ -487,8 +487,9 @@ class SACAgent:
 
     def _soft_update(self, source: nn.Module, target: nn.Module) -> None:
         tau = self.cfg.sac.tau
-        for p, t in zip(source.parameters(), target.parameters()):
-            t.data.copy_(tau * p.data + (1.0 - tau) * t.data)
+        with torch.no_grad():
+            for p, t in zip(source.parameters(), target.parameters()):
+                t.copy_(tau * p + (1.0 - tau) * t)
 
     def get_actor_state(self, *, cpu_clone: bool = True) -> dict[str, torch.Tensor]:
         if cpu_clone:
