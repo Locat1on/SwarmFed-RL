@@ -1,4 +1,5 @@
 import argparse
+import logging
 import sys
 
 from pathlib import Path
@@ -75,7 +76,13 @@ def main() -> None:
     parser.add_argument("--disable-async-exchange", action="store_true", help="Disable asynchronous P2P exchange (default: enabled)")
     parser.add_argument("--run-name", type=str, default=None, help="Name of the run (default: auto-generated)")
     parser.add_argument("--artifact-root", type=str, default="artifacts", help="Root directory for artifacts")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging for P2P exchange timing")
     args = parser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format="%(name)s %(message)s")
+    else:
+        logging.basicConfig(level=logging.WARNING)
 
     if args.defense and args.mode != "p2p":
         print(f"Warning: --defense requires --mode p2p. Forcing p2p mode.")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -9,6 +11,8 @@ import torch
 
 from .config import P2PConfig
 from .sac import SACAgent
+
+_log = logging.getLogger(__name__)
 
 
 def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -89,20 +93,13 @@ def cosine_similarity_state_dict(
     state_a: dict[str, torch.Tensor],
     state_b: dict[str, torch.Tensor],
 ) -> float:
-    dot_product = 0.0
-    norm_a_sq = 0.0
-    norm_b_sq = 0.0
-    for k in state_a:
-        a_flat = state_a[k].float().view(-1)
-        b_flat = state_b[k].float().view(-1)
-        dot_product += torch.dot(a_flat, b_flat).item()
-        norm_a_sq += torch.sum(a_flat ** 2).item()
-        norm_b_sq += torch.sum(b_flat ** 2).item()
-        
-    denom = (norm_a_sq ** 0.5) * (norm_b_sq ** 0.5)
+    # Vectorised: concatenate all params into single vectors to avoid per-layer .item() overhead
+    a_vec = torch.cat([state_a[k].float().reshape(-1) for k in state_a])
+    b_vec = torch.cat([state_b[k].float().reshape(-1) for k in state_b])
+    denom = torch.linalg.norm(a_vec) * torch.linalg.norm(b_vec)
     if denom == 0.0:
         return 0.0
-    return dot_product / denom
+    return float(torch.dot(a_vec, b_vec).item() / denom.item())
 
 
 def state_dict_to_vector(state: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -202,79 +199,95 @@ class P2PAggregator:
 
         malicious_nodes = malicious_nodes or set()
         ids = sorted(agents.keys())
+
+        _t_extract = time.monotonic()
         current_states = {rid: agents[rid].get_actor_state(cpu_clone=True) for rid in ids}
-        
+        _t_quant = time.monotonic()
+
         # FP16 quantization for communication
         if self.cfg.use_fp16_comm:
             current_states = {rid: quantize_state_fp16(s) for rid, s in current_states.items()}
-            payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
-        else:
-            payload_bytes_cache = {rid: self._estimate_payload_bytes(current_states[rid]) for rid in ids}
-        
+
+        # Compute payload bytes once (shared across all pairs for same model size)
+        _sample_bytes = self._estimate_payload_bytes(current_states[ids[0]])
+        payload_bytes_cache = {rid: _sample_bytes for rid in ids}
+        _t_prep_done = time.monotonic()
+        _log.debug(
+            "exchange step=%d: extract=%.3fs quant=%.3fs",
+            step_idx, _t_quant - _t_extract, _t_prep_done - _t_quant,
+        )
+
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0
         local_bytes_transferred = 0
+        exchanged_pairs: list[tuple[int, int]] = []
+
+        _t0 = time.monotonic()
+        use_layer_filter = self.cfg.layer_diff_threshold > 0
+        malicious_active = bool(malicious_nodes) and step_idx >= attack_start_step
 
         for a, b in self._candidate_pairs(ids, positions):
-                if not self._can_exchange(step_idx, a, b, positions):
-                    continue
-                payload_bytes = payload_bytes_cache[a]
-                # Actual bytes after FP16 is already reflected in payload_bytes_cache
-                local_bytes_transferred += payload_bytes * 2
+            if not self._can_exchange(step_idx, a, b, positions):
+                continue
+            payload_bytes = payload_bytes_cache[a]
+            local_bytes_transferred += payload_bytes * 2
 
+            # Only apply attack processing if there are active malicious nodes
+            if malicious_active:
                 incoming_to_a = self._apply_attack(
-                    step_idx=step_idx,
-                    sender_id=b,
+                    step_idx=step_idx, sender_id=b,
                     original_state=current_states[b],
                     malicious_nodes=malicious_nodes,
                     attack_type=attack_type,
                     attack_start_step=attack_start_step,
                 )
                 incoming_to_b = self._apply_attack(
-                    step_idx=step_idx,
-                    sender_id=a,
+                    step_idx=step_idx, sender_id=a,
                     original_state=current_states[a],
                     malicious_nodes=malicious_nodes,
                     attack_type=attack_type,
                     attack_start_step=attack_start_step,
                 )
-                
-                # Selective layer filtering if enabled
-                if self.cfg.layer_diff_threshold > 0:
-                    local_a_fp16 = current_states[a]
-                    local_b_fp16 = current_states[b]
-                    incoming_to_a_filtered = selective_layer_filter(local_a_fp16, incoming_to_a, self.cfg.layer_diff_threshold)
-                    incoming_to_b_filtered = selective_layer_filter(local_b_fp16, incoming_to_b, self.cfg.layer_diff_threshold)
-                    # Update local state with filtered incoming
-                    incoming_to_a = {**local_a_fp16, **incoming_to_a_filtered}
-                    incoming_to_b = {**local_b_fp16, **incoming_to_b_filtered}
-                
-                # Calculate distance for dynamic beta
-                dist_ab = euclidean_distance(positions[a], positions[b])
-                
-                incoming[a].append(
-                    IncomingCandidate(
-                        sender_id=b,
-                        state=incoming_to_a,
-                        sender_is_malicious=(b in malicious_nodes and step_idx >= attack_start_step),
-                        distance=dist_ab,
-                    )
-                )
-                incoming[b].append(
-                    IncomingCandidate(
-                        sender_id=a,
-                        state=incoming_to_b,
-                        sender_is_malicious=(a in malicious_nodes and step_idx >= attack_start_step),
-                        distance=dist_ab,
-                    )
-                )
-                with self._lock:
-                    self._last_exchange[(a, b)] = step_idx
-                exchanges += 1
+            else:
+                incoming_to_a = current_states[b]
+                incoming_to_b = current_states[a]
 
+            # Selective layer filtering if enabled
+            if use_layer_filter:
+                local_a = current_states[a]
+                local_b = current_states[b]
+                filtered_a = selective_layer_filter(local_a, incoming_to_a, self.cfg.layer_diff_threshold)
+                filtered_b = selective_layer_filter(local_b, incoming_to_b, self.cfg.layer_diff_threshold)
+                incoming_to_a = {**local_a, **filtered_a}
+                incoming_to_b = {**local_b, **filtered_b}
+
+            dist_ab = euclidean_distance(positions[a], positions[b])
+
+            incoming[a].append(
+                IncomingCandidate(
+                    sender_id=b, state=incoming_to_a,
+                    sender_is_malicious=(malicious_active and b in malicious_nodes),
+                    distance=dist_ab,
+                )
+            )
+            incoming[b].append(
+                IncomingCandidate(
+                    sender_id=a, state=incoming_to_b,
+                    sender_is_malicious=(malicious_active and a in malicious_nodes),
+                    distance=dist_ab,
+                )
+            )
+            exchanged_pairs.append((a, b))
+            exchanges += 1
+
+        # Batch lock acquisition instead of per-pair
+        _t1 = time.monotonic()
         with self._lock:
+            for a, b in exchanged_pairs:
+                self._last_exchange[(a, b)] = step_idx
             self.bytes_transferred += local_bytes_transferred
 
+        _t2 = time.monotonic()
         merged_states = {}
         for rid in ids:
             if rid not in incoming:
@@ -294,6 +307,12 @@ class P2PAggregator:
             if self.cfg.use_fp16_comm:
                 merged = dequantize_state_fp16(merged)
             merged_states[rid] = merged
+
+        _t3 = time.monotonic()
+        _log.debug(
+            "exchange step=%d: pairs=%.3fs lock=%.3fs merge=%.3fs total=%.3fs exch=%d",
+            step_idx, _t1 - _t0, _t2 - _t1, _t3 - _t2, _t3 - _t0, exchanges,
+        )
         return exchanges, merged_states
 
     def _candidate_pairs(
@@ -322,14 +341,10 @@ class P2PAggregator:
         return sorted(pair_set)
 
     def _estimate_payload_bytes(self, state: dict[str, torch.Tensor]) -> int:
-        threshold = max(0.0, float(self.cfg.weight_std_threshold))
-        estimated = 0
-        for k, v in state.items():
-            if float(torch.std(v).item()) > threshold:
-                estimated += v.numel() * v.element_size()
-        if estimated == 0:
-            return sum(v.numel() * v.element_size() for v in state.values())
-        return estimated
+        # Fast path: just sum up the raw bytes without expensive std() calls.
+        # The std-based filtering was a minor optimization for logging accuracy
+        # but cost more than it saved due to per-layer torch.std() computation.
+        return sum(v.numel() * v.element_size() for v in state.values())
 
     def _can_exchange(
         self,
@@ -482,9 +497,10 @@ class P2PAggregator:
             b_low = self.cfg.beta_min
             beta = b_high - (b_high - b_low) * normalized_dist
         
+        inv_beta = 1.0 - beta
         out: dict[str, torch.Tensor] = {}
         for k in local_state:
-            out[k] = beta * local_state[k] + (1.0 - beta) * incoming_state[k]
+            out[k] = torch.lerp(incoming_state[k], local_state[k], beta)
         return out
 
     def _apply_attack(
@@ -528,23 +544,21 @@ class CentralizedFedAvg:
             return 0, {}
 
         ids = sorted(agents.keys())
-        states = {rid: agents[rid].get_actor_state() for rid in ids}
+        states = {rid: agents[rid].get_actor_state(cpu_clone=True) for rid in ids}
         merged: dict[str, torch.Tensor] = {}
 
         for k in states[ids[0]]:
             stacked = torch.stack([states[rid][k] for rid in ids], dim=0)
             merged[k] = stacked.mean(dim=0)
 
-        payload_one_way = 0
-        for k in merged:
-            payload_one_way += merged[k].numel() * merged[k].element_size()
-        
+        payload_one_way = sum(v.numel() * v.element_size() for v in merged.values())
+
         with self._lock:
             self.bytes_transferred += payload_one_way * (len(ids) * 2)
 
         merged_states = {}
         for rid in ids:
-            blended = self._blend(agents[rid].get_actor_state(), merged)
+            blended = self._blend(states[rid], merged)  # Reuse already-extracted states
             merged_states[rid] = blended
         return 1, merged_states
 

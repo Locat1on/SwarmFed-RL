@@ -206,7 +206,13 @@ def run_experiment(
     total_env_time = 0.0
     total_train_time = 0.0
     total_exchange_time = 0.0
-    
+    # Interval-level timing for debug
+    interval_env_time = 0.0
+    interval_train_time = 0.0
+    interval_exchange_time = 0.0
+    interval_sync_wait_time = 0.0
+    interval_sync_wait_count = 0
+
     episode_return_mean = 0.0
 
     try:
@@ -282,7 +288,9 @@ def run_experiment(
                         epoch_collisions += 1
 
                 env_step_end = time.time()
-                total_env_time += (env_step_end - env_step_start)
+                _env_dur = env_step_end - env_step_start
+                total_env_time += _env_dur
+                interval_env_time += _env_dur
 
                 # 3. Synchronize Exchange BEFORE Training
                 # We must ensure any background weights updates are fully merged before
@@ -307,7 +315,11 @@ def run_experiment(
                 
                 # If we hit an exchange interval but the previous one isn't done, force wait
                 if step % cfg.p2p.exchange_interval_steps == 0 and exchange_future is not None:
+                    _sync_wait_start = time.time()
                     res, merged_states = exchange_future.result()
+                    _sync_wait_dur = time.time() - _sync_wait_start
+                    interval_sync_wait_time += _sync_wait_dur
+                    interval_sync_wait_count += 1
                     exchanges += res
                     epoch_exchanges += res
                     exchange_future = None
@@ -323,7 +335,9 @@ def run_experiment(
                             agents[rid].load_actor_state(state)
 
                 exchange_sync_end = time.time()
-                total_exchange_time += (exchange_sync_end - exchange_sync_start)
+                _exch_sync_dur = exchange_sync_end - exchange_sync_start
+                total_exchange_time += _exch_sync_dur
+                interval_exchange_time += _exch_sync_dur
 
                 # 4. Training
                 train_start = time.time()
@@ -341,7 +355,9 @@ def run_experiment(
                         for sa in shadow_agents.values():
                             sa.load_actor_state(shared_state)
                 train_end = time.time()
-                total_train_time += (train_end - train_start)
+                _train_dur = train_end - train_start
+                total_train_time += _train_dur
+                interval_train_time += _train_dur
                 
                 # 5. Initiate new P2P exchange
                 exchange_init_start = time.time()
@@ -467,7 +483,9 @@ def run_experiment(
                         comm_bytes = centralized.bytes_transferred
                 
                 exchange_init_end = time.time()
-                total_exchange_time += (exchange_init_end - exchange_init_start)
+                _exch_init_dur = exchange_init_end - exchange_init_start
+                total_exchange_time += _exch_init_dur
+                interval_exchange_time += _exch_init_dur
 
                 cumulative_reward += step_reward
                 epoch_reward += step_reward
@@ -527,17 +545,34 @@ def run_experiment(
                         # Use the actual robot index that was trained in this step
                         actual_rid_trained = step % num_robots
                         train_label = "train" if shared_agent else f"train(r{actual_rid_trained})"
+                        # Interval-level timing (delta since last log)
+                        i_total = interval_env_time + interval_train_time + interval_exchange_time
+                        i_env_pct = (interval_env_time / i_total * 100) if i_total > 0 else 0
+                        i_train_pct = (interval_train_time / i_total * 100) if i_total > 0 else 0
+                        i_exch_pct = (interval_exchange_time / i_total * 100) if i_total > 0 else 0
+
+                        sync_wait_str = ""
+                        if interval_sync_wait_count > 0:
+                            sync_wait_str = f" | sync_wait={interval_sync_wait_time:.2f}s({interval_sync_wait_count}x)"
+
                         print(
                             f"[{mode}] epoch={epoch+1}/{cfg.max_epochs} step={current_step}/{cfg.max_timesteps} | "
                             f"eps={episodes} rew={cumulative_reward:.2f} "
                             f"succ={successes} coll={collisions} | "
                             f"exch={exchanges} bytes={comm_bytes/1e6:.1f}MB | "
                             f"speed={steps_per_sec:.2f}step/s | "
-                            f"time: env={env_pct:.0f}% {train_label}={train_pct:.0f}% p2p={exchange_pct:.0f}%",
+                            f"time: env={env_pct:.0f}% {train_label}={train_pct:.0f}% p2p={exchange_pct:.0f}% | "
+                            f"delta: env={i_env_pct:.0f}% train={i_train_pct:.0f}% p2p={i_exch_pct:.0f}%"
+                            f"{sync_wait_str}",
                             flush=True,
                         )
                         last_log_time = now
                         steps_since_last_log = 0
+                        interval_env_time = 0.0
+                        interval_train_time = 0.0
+                        interval_exchange_time = 0.0
+                        interval_sync_wait_time = 0.0
+                        interval_sync_wait_count = 0
             
             # End of epoch logging
             if epoch_writer:
