@@ -177,6 +177,7 @@ class P2PAggregator:
         self._sim_stat = RunningStat()
         self.rejected_by_sender: dict[int, int] = defaultdict(int)
         self.last_similarity_threshold = -1.0
+        self._lock = threading.Lock()
 
     def maybe_exchange(
         self,
@@ -212,13 +213,14 @@ class P2PAggregator:
         
         incoming: dict[int, list[IncomingCandidate]] = defaultdict(list)
         exchanges = 0
+        local_bytes_transferred = 0
 
         for a, b in self._candidate_pairs(ids, positions):
                 if not self._can_exchange(step_idx, a, b, positions):
                     continue
                 payload_bytes = payload_bytes_cache[a]
                 # Actual bytes after FP16 is already reflected in payload_bytes_cache
-                self.bytes_transferred += payload_bytes * 2
+                local_bytes_transferred += payload_bytes * 2
 
                 incoming_to_a = self._apply_attack(
                     step_idx=step_idx,
