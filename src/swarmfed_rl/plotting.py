@@ -137,15 +137,27 @@ def _smooth(series: pd.Series, window: int) -> pd.Series:
 
 def _plot_episode_return(df: pd.DataFrame, out_dir: str) -> str:
     fig, ax = plt.subplots(figsize=_FIGSIZE)
-    window = max(int(len(df) * 0.05), 50)
 
-    ax.plot(df["step"], df["episode_return_mean"],
-            label="Episode Return (running avg)", color="#1f77b4", linewidth=2)
+    ret = df["episode_return_mean"]
+    # Skip early warm-up phase where episode count < 5 (noisy outliers)
+    episodes = df["episodes"]
+    warmup_mask = episodes >= 5
+    plot_df = df[warmup_mask].reset_index(drop=True)
+    if plot_df.empty:
+        plot_df = df
+
+    ret_plot = plot_df["episode_return_mean"]
+    window = max(int(len(plot_df) * 0.05), 50)
+    smoothed = _smooth(ret_plot, window)
+
+    ax.plot(plot_df["step"], ret_plot, alpha=0.25, color="#1f77b4", linewidth=0.8)
+    ax.plot(plot_df["step"], smoothed,
+            label=f"Episode Return (smooth w={window})", color="#1f77b4", linewidth=2)
     ax.fill_between(
-        df["step"],
-        _smooth(df["step_reward"], window) * 0.8,
-        _smooth(df["step_reward"], window) * 1.2,
-        alpha=0.1, color="#1f77b4",
+        plot_df["step"],
+        _smooth(ret_plot, window * 2) - ret_plot.rolling(window, min_periods=1).std(),
+        _smooth(ret_plot, window * 2) + ret_plot.rolling(window, min_periods=1).std(),
+        alpha=0.12, color="#1f77b4", label="±1 std",
     )
     _style_ax(ax, "Timesteps", "Return", "Layer 1: Episode Return Convergence")
     path = str(Path(out_dir) / "L1_episode_return.png")
