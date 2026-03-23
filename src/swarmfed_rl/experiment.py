@@ -63,6 +63,8 @@ def run_experiment(
     steps_per_epoch: int | None = None,
     num_obstacles: int | None = None,
     obstacle_radius: float | None = None,
+    max_episode_steps: int | None = None,
+    goal_threshold: float | None = None,
     seed: int,
     log_csv_path: str | None = None,
     checkpoint_dir: str | None = None,
@@ -105,7 +107,8 @@ def run_experiment(
     cfg = build_config(
         seed=seed, max_timesteps=max_timesteps, max_epochs=max_epochs,
         steps_per_epoch=steps_per_epoch, num_obstacles=num_obstacles,
-        obstacle_radius=obstacle_radius, comm_radius=comm_radius,
+        obstacle_radius=obstacle_radius, max_episode_steps=max_episode_steps,
+        goal_threshold=goal_threshold, comm_radius=comm_radius,
         cooldown_steps=cooldown_steps, exchange_interval_steps=exchange_interval_steps,
         weight_std_threshold=weight_std_threshold, frame_stack=frame_stack,
         use_gpu_replay=use_gpu_replay, use_grid_index=use_grid_index,

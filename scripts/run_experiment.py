@@ -41,6 +41,8 @@ def main() -> None:
     parser.add_argument("--steps-per-epoch", type=int, default=2000)
     parser.add_argument("--num-obstacles", type=int, default=5)
     parser.add_argument("--obstacle-radius", type=float, default=0.3)
+    parser.add_argument("--max-episode-steps", type=int, default=None)
+    parser.add_argument("--goal-threshold", type=float, default=None)
     parser.add_argument("--beta-schedule", choices=["constant", "linear", "exponential"], default="constant")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-csv", type=str, default=None)
@@ -167,6 +169,8 @@ def main() -> None:
                 steps_per_epoch=args.steps_per_epoch,
                 num_obstacles=args.num_obstacles,
                 obstacle_radius=args.obstacle_radius,
+                max_episode_steps=args.max_episode_steps,
+                goal_threshold=args.goal_threshold,
                 beta_schedule=args.beta_schedule,
                 seed=args.seed,
                 log_csv_path=str(log_csv_path),

@@ -26,6 +26,10 @@ def main() -> None:
         default=500,
         help="print progress every N timesteps",
     )
+    parser.add_argument("--num-obstacles", type=int, default=None)
+    parser.add_argument("--obstacle-radius", type=float, default=None)
+    parser.add_argument("--max-episode-steps", type=int, default=None)
+    parser.add_argument("--goal-threshold", type=float, default=None)
     args = parser.parse_args()
     run_phase1(
         num_robots=args.robots,
@@ -35,6 +39,10 @@ def main() -> None:
         checkpoint_dir=args.checkpoint_dir,
         log_csv_path=args.log_csv,
         progress_every=args.progress_every,
+        num_obstacles=args.num_obstacles,
+        obstacle_radius=args.obstacle_radius,
+        max_episode_steps=args.max_episode_steps,
+        goal_threshold=args.goal_threshold,
     )
 
 

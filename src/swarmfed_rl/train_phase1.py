@@ -24,6 +24,10 @@ def run_phase1(
     checkpoint_dir: str | None = None,
     log_csv_path: str | None = None,
     progress_every: int | None = None,
+    num_obstacles: int | None = None,
+    obstacle_radius: float | None = None,
+    max_episode_steps: int | None = None,
+    goal_threshold: float | None = None,
 ) -> RunnerStats:
     mode = "local" if warmup_only else "p2p"
     summary = run_experiment(
@@ -34,6 +38,10 @@ def run_phase1(
         log_csv_path=log_csv_path,
         checkpoint_dir=checkpoint_dir,
         progress_every=progress_every,
+        num_obstacles=num_obstacles,
+        obstacle_radius=obstacle_radius,
+        max_episode_steps=max_episode_steps,
+        goal_threshold=goal_threshold,
     )
     stats = RunnerStats(
         timesteps=summary.timesteps,
