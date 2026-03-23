@@ -20,7 +20,7 @@ class TestSACStability(unittest.TestCase):
             done = bool(np.random.randint(0, 2))
             agent.buffer.push(state, action, reward, next_state, done)
 
-        out = agent.train_step()
+        out = agent.train_step(pull_metrics=True)
         self.assertIn("q1_loss", out)
         self.assertTrue(np.isfinite(out["q1_loss"]))
         self.assertTrue(np.isfinite(out["q2_loss"]))
